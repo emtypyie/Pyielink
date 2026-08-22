@@ -25,10 +25,14 @@ fn usage() -> String {
         "pyielink v{} — emtypyie remote access framework\n\n\
          USAGE:\n\
          \x20 pyielink                     interactive launcher\n\
-         \x20 pyielink <user>@<ip>         connect to a remote host\n\
+         \x20 pyielink <user>@<ip>         connect to a remote host (interactive session)\n\
+         \x20 pyielink get <user>@<ip> <remote> [local]\n\
+         \x20                              download a file from the host, then exit\n\
+         \x20 pyielink put <user>@<ip> <local> [remote]\n\
+         \x20                              upload a file to the host, then exit\n\
           \x20 pyielink /enable [--port N]  open this device for connections (default port {})\n\
-          \x20 pyielink /adduser -m <name> [-r user|admin]\n\
-          \x20                              create a local account (admin may run 'sudo' remotely)\n\
+           \x20 pyielink /adduser -m <name> [-r user|admin]\n\
+           \x20                              create a local account (admin may run 'sudo' remotely)\n\
          \x20 pyielink -h | --help         this help\n\
          \x20 pyielink -v | --version      version",
         env!("CARGO_PKG_VERSION"),
@@ -48,6 +52,22 @@ fn run(args: Vec<String>) -> Result<(), String> {
             Ok(())
         }
         Some(a) if a.contains('@') => client::run_connect(a),
+        Some("get") => {
+            // get <user>@<ip> <remote> [local]
+            match args.len() {
+                3 => client::run_get(&args[1], &args[2], None),
+                4 => client::run_get(&args[1], &args[2], Some(&args[3])),
+                _ => Err("usage: pyielink get <user>@<ip> <remote> [local]".into()),
+            }
+        }
+        Some("put") => {
+            // put <user>@<ip> <local> [remote]
+            match args.len() {
+                3 => client::run_put(&args[1], &args[2], None),
+                4 => client::run_put(&args[1], &args[2], Some(&args[3])),
+                _ => Err("usage: pyielink put <user>@<ip> <local> [remote]".into()),
+            }
+        }
         Some("/enable") => {
             let port = parse_port(args.get(2))?; // /enable --port N
             cmd_enable_and_listen(port)

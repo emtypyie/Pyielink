@@ -3,6 +3,7 @@ import process from "node:process";
 import { WebSocketServer } from "ws";
 import { Mux, keysMatch, CHANNELS } from "./mux.js";
 import { Heartbeat } from "./heartbeat.js";
+import { FileService } from "./files.js";
 
 const DEFAULT_PORT = 4243;
 const AUTH_WINDOW_MS = 10000;
@@ -85,15 +86,18 @@ wss.on("connection", (ws) => {
     hb = new Heartbeat(mux, {
       onLost: () => {
         console.warn("[pyielink-dl] heartbeat lost - closing 4002");
+        files.teardownAll();
         ws.close(4002, "heartbeat lost");
       },
       onRtt: (ms) => console.log(`[pyielink-dl] rtt ${ms} ms`),
     });
+    const files = new FileService(mux, session, (m) => console.log(m));
     hb.start();
     ws.on("close", (code) => {
       if (code === 1000 || code === 1005) {
         hb.stop();
       }
+      files.teardownAll();
       console.log(`[pyielink-dl] client disconnected (code ${code})`);
     });
   });
