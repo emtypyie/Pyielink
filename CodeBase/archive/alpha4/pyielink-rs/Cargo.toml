@@ -7,6 +7,7 @@ edition = "2024"
 rand = "0.8"
 sha2 = "0.10"
 aes-gcm = "0.10"
+tungstenite = "0.24"
 
 [profile.release]
 opt-level = "s"

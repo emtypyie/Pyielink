@@ -3,11 +3,21 @@ use crate::proto::{self, *};
 use crate::token;
 use std::io::Write;
 use std::net::{TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tungstenite::{Message, WebSocket};
 
 const BOOTSTRAP_PORT: u16 = 4242;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HB_STALE: Duration = Duration::from_secs(20);
+/// data-link lifecycle: 0 = connecting/authenticating, 1 = up, 2 = dead
+const DL_CONNECTING: u8 = 0;
+const DL_UP: u8 = 1;
+const DL_DEAD: u8 = 2;
+const DL_POLL: Duration = Duration::from_millis(200);
+const DL_STALE: Duration = Duration::from_secs(15);
+const DL_PING_EVERY: Duration = Duration::from_secs(5);
 
 pub fn parse_target(arg: &str) -> Result<(String, String), String> {
     let (user, ip) = arg
@@ -109,11 +119,18 @@ pub fn run_connect(target: &str) -> Result<(), String> {
             }
             (AUTH_OK, payload) => {
                 let ticket = String::from_utf8_lossy(&payload).into_owned();
-                let (data_port, _session_key) = split_ticket(ticket.trim())?;
+                let (data_port, session_key) = split_ticket(ticket.trim())?;
                 println!(
                     "  [ok] session promoted. data layer ready on {}:{}. session key received.",
                     ip, data_port
                 );
+                let dl_state = Arc::new(AtomicU8::new(DL_CONNECTING));
+                let dl_stop = Arc::new(AtomicU8::new(0));
+                let dl_handle = {
+                    let (ip, port, key, state, stop) =
+                        (ip.clone(), data_port.clone(), session_key.clone(), Arc::clone(&dl_state), Arc::clone(&dl_stop));
+                    std::thread::spawn(move || data_link_loop(&ip, &port, &key, state, stop))
+                };
                 let interactive = std::env::var("PYIELINK_SHELL").ok().as_deref() == Some("1")
                     || creds::stdin_is_tty();
                 if interactive {
@@ -121,7 +138,10 @@ pub fn run_connect(target: &str) -> Result<(), String> {
                     print!("pyielink> ");
                     let _ = std::io::stdout().flush();
                 }
-                post_auth_loop(&mut stream, interactive)?;
+                let outcome = post_auth_loop(&mut stream, interactive, &dl_state);
+                dl_stop.store(1, Ordering::Relaxed);
+                let _ = dl_handle.join();
+                outcome?;
                 return Ok(());
             }
             (AUTH_FAIL, payload) => {
@@ -180,9 +200,176 @@ fn spawn_stdin_reader() -> std::sync::mpsc::Receiver<StdinMsg> {
     rx
 }
 
+/// mux framing identical to datalayer/src/mux.js: [u8 channel][u32 len BE][payload]
+fn dl_frame(channel: u8, payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(5 + payload.len());
+    buf.push(channel);
+    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    buf.extend_from_slice(payload);
+    buf
+}
+
+fn dl_parse(buf: &[u8]) -> Option<(u8, &[u8])> {
+    if buf.len() < 5 {
+        return None;
+    }
+    let ch = buf[0];
+    let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    if buf.len() < 5 + len {
+        return None;
+    }
+    Some((ch, &buf[5..5 + len]))
+}
+
+/// Native data-plane client: ws handshake with the session key, then a
+/// control-channel heartbeat service (answer PINGs, emit own PINGs, RTT log)
+/// under a staleness watchdog. Exits when `stop` flips to 1 or the link dies.
+fn data_link_loop(
+    ip: &str,
+    port: &str,
+    key: &str,
+    state: Arc<AtomicU8>,
+    stop: Arc<AtomicU8>,
+) {
+    let addr = format!("{}:{}", ip, port);
+    let tcp = match TcpStream::connect(&addr) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("  [dl-link] cannot reach {}: {}", addr, e);
+            state.store(DL_DEAD, Ordering::Relaxed);
+            return;
+        }
+    };
+    let _ = tcp.set_nodelay(true);
+    let _ = tcp.set_read_timeout(Some(DL_POLL));
+    let _ = tcp.set_write_timeout(Some(CONNECT_TIMEOUT));
+    let url = format!("ws://{}/", addr);
+    let mut ws: WebSocket<TcpStream> = match tungstenite::client(url, tcp) {
+        Ok((ws, _)) => ws,
+        Err(e) => {
+            eprintln!("  [dl-link] websocket handshake failed: {}", e);
+            state.store(DL_DEAD, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    // first message must be the session key; server answers a plain JSON ack
+    if ws.send(Message::Text(format!("{{\"k\":\"{}\"}}", key))).is_err() {
+        eprintln!("  [dl-link] failed to send session key");
+        state.store(DL_DEAD, Ordering::Relaxed);
+        return;
+    }
+    loop {
+        if stop.load(Ordering::Relaxed) == 1 {
+            dl_shutdown(&mut ws);
+            return;
+        }
+        match ws.read() {
+            Ok(Message::Text(t)) => {
+                if t.contains("\"ok\":true") || t.contains("\"ok\": true") {
+                    println!("  [dl-link] data channel up ({})", t.trim());
+                    break;
+                }
+                eprintln!("  [dl-link] unexpected ack: {}", t.trim());
+                state.store(DL_DEAD, Ordering::Relaxed);
+                return;
+            }
+            Ok(Message::Close(c)) => {
+                eprintln!(
+                    "  [dl-link] rejected by data layer (code {})",
+                    c.map(|f| u16::from(f.code)).unwrap_or(0)
+                );
+                state.store(DL_DEAD, Ordering::Relaxed);
+                return;
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(ref e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(e) => {
+                eprintln!("  [dl-link] auth read failed: {}", e);
+                state.store(DL_DEAD, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+    state.store(DL_UP, Ordering::Relaxed);
+
+    // control-channel heartbeat: answer server PINGs, send our own, log RTT
+    let mut last_seen = Instant::now();
+    let mut next_ping = Instant::now() + DL_PING_EVERY;
+    let mut awaiting_pong_at: Option<(u128, Instant)> = None;
+    loop {
+        if stop.load(Ordering::Relaxed) == 1 {
+            dl_shutdown(&mut ws);
+            return;
+        }
+        match ws.read() {
+            Ok(Message::Binary(buf)) => match dl_parse(&buf) {
+                Some((0x01, payload)) if payload.first() == Some(&b'P') => {
+                    last_seen = Instant::now();
+                    let _ = ws.send(Message::Binary(dl_frame(0x01, payload))); // PONG echoes nonce
+                }
+                Some((0x01, payload)) if payload.first() == Some(&b'Q') => {
+                    last_seen = Instant::now();
+                    if let Some((sent_ms, _)) =
+                        awaiting_pong_at.take_if(|(ms, _)| payload.get(1..) == Some(ms.to_string().as_bytes()))
+                    {
+                        println!("  [dl-hb] rtt {}ms", now_ms().saturating_sub(sent_ms));
+                    }
+                }
+                _ => {} // other channels arrive in later phases; ignore unknown
+            },
+            Ok(Message::Close(_)) | Ok(Message::Frame(_)) => {
+                println!("  [dl-link] data layer closed the channel");
+                state.store(DL_DEAD, Ordering::Relaxed);
+                return;
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(ref e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if last_seen.elapsed() >= DL_STALE {
+                    eprintln!("  [dl-link] data layer stopped responding — tearing down");
+                    state.store(DL_DEAD, Ordering::Relaxed);
+                    return;
+                }
+                if next_ping.elapsed() >= Duration::from_secs(0) {
+                    let ms = now_ms();
+                    if ws.send(Message::Binary(dl_frame(0x01, format!("P{}", ms).as_bytes()))).is_err() {
+                        eprintln!("  [dl-link] ping send failed");
+                        state.store(DL_DEAD, Ordering::Relaxed);
+                        return;
+                    }
+                    awaiting_pong_at = Some((ms, Instant::now()));
+                    next_ping += DL_PING_EVERY;
+                }
+            }
+            Err(e) => {
+                eprintln!("  [dl-link] read failed: {}", e);
+                state.store(DL_DEAD, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+}
+
+fn dl_shutdown(ws: &mut WebSocket<TcpStream>) {
+    let _ = ws.close(None);
+    let _ = ws.flush();
+}
+
 /// Root channel: answers host pings, streams remote-command output, and in
 /// interactive mode feeds typed lines to the host's terminal channel.
-fn post_auth_loop(stream: &mut TcpStream, interactive: bool) -> Result<(), String> {
+fn post_auth_loop(
+    stream: &mut TcpStream,
+    interactive: bool,
+    dl_state: &AtomicU8,
+) -> Result<(), String> {
     let stdin_rx = if interactive { Some(spawn_stdin_reader()) } else { None };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
     let mut last_ping_seen = Instant::now();
@@ -281,6 +468,10 @@ fn post_auth_loop(stream: &mut TcpStream, interactive: bool) -> Result<(), Strin
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
+                if dl_state.load(Ordering::Relaxed) == DL_DEAD {
+                    let _ = proto::write_frame(stream, BYE, b"data-link lost");
+                    return Err("data link died — session ended".into());
+                }
                 if last_ping_seen.elapsed() >= HB_STALE {
                     let _ = proto::write_frame(stream, BYE, b"stall");
                     return Err("host stopped responding to heartbeats".into());

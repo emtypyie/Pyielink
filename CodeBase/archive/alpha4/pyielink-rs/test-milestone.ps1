@@ -328,6 +328,8 @@ try {
     Assert ($joined -match "session promoted") "real client promoted with stored token only"
     Assert ($joined -notmatch "password:") "no password prompt on token path"
     Assert ($joined -match "rtt \d+ms") "real client sees heartbeats"
+    Assert ($joined -match "data channel up") "native ws data link authenticated by real client"
+    Assert ((Select-String -Path "$PSScriptRoot\_host_out.log" -Pattern "client authenticated (bob)" -SimpleMatch).Count -ge 1) "host drained node auth telemetry for native client"
 
     Write-Host "[11b] remote terminal: standard role denied sudo, normal commands ok"
     $aliceHash = Get-StoredSecret "alice" "pw_hash"

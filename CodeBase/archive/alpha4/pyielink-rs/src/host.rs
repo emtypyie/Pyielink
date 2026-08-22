@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const DATA_PORT: &str = "4243"; // informational default; real port is ephemeral per session
 const MAX_AUTH_ATTEMPTS: u32 = 3;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const PING_INTERVAL: Duration = Duration::from_secs(5);
@@ -260,7 +259,7 @@ fn handle_conn(mut stream: TcpStream) {
     // the client never ends up half-promoted.
     let session_key = sessions::open_session(user, peer_ip);
     let role = if record0.is_admin() { "admin" } else { "user" };
-    let (mut datalayer, dl_port) = match spawn_datalayer(&session_key, user, role) {
+    let (datalayer, dl_port) = match spawn_datalayer(&session_key, user, role) {
         Ok(x) => x,
         Err(reason) => {
             println!("  [denied] {} — promotion failed: {}", peer, reason);
