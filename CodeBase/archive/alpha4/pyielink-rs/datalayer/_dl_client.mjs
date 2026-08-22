@@ -34,7 +34,8 @@ await new Promise((resolve) => {
 let authed = false;
 let echoMatch = false;
 let pingsSeen = 0;
-let rttSamples = 0;
+let closedEarly = false;
+let windowDone = false;
 const echoToken = "mux-echo-" + Date.now();
 
 await new Promise((resolve) => {
@@ -62,13 +63,21 @@ await new Promise((resolve) => {
       good.send(frame(1, "PONG"));
     }
   });
-  good.on("close", () => resolve());
+  good.on("close", (code) => {
+    if (!windowDone) {
+      closedEarly = true;
+      console.log(`early close detected (code ${code})`);
+      check("stayed connected through stability window", false);
+    }
+    resolve();
+  });
   good.on("error", () => {});
   setTimeout(() => {
+    windowDone = true;
+    check("stayed connected through stability window", !closedEarly);
     check("auth ack received", authed);
     check(`control-channel mux round-trip echo (${echoToken})`, echoMatch);
-    check(`survived stability window answering ${pingsSeen} heartbeats`, pingsSeen >= 2 && authed);
-    console.log(`rtt samples seen: ${rttSamples}`);
+    check(`answered ${pingsSeen} server heartbeats`, pingsSeen >= 2 && authed && !closedEarly);
     good.terminate();
   }, stabMs);
 });

@@ -223,7 +223,7 @@ try {
     $ok = Read-Frame $c
     Expect $ok 0x09 "auth ok"
     $parts = $ok.Text -split "`n"
-    Assert (($parts.Count -eq 2) -and ($parts[0] -eq "4243") -and ($parts[1] -cmatch '^[0-9a-f]{64}$')) "promotion ticket = data port + session key"
+    Assert (($parts.Count -eq 2) -and ($parts[0] -cmatch '^\d{4,5}$') -and ($parts[0] -ne "4242") -and ($parts[1] -cmatch '^[0-9a-f]{64}$')) "promotion ticket = ephemeral data port + session key"
     $script:bobToken = $tok.Text
     $script:bobTokenHash = Get-Sha256Hex $tok.Text
     $script:keyA = $parts[1]

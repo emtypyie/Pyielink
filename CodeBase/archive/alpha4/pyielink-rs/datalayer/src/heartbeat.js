@@ -47,18 +47,27 @@ export class Heartbeat {
   }
 
   _tick() {
-    if (!this.mux.ws || this.mux.ws.readyState !== 1) return;
-    if (!this.mux.send(CHANNELS.CONTROL, PING)) return;
-    if (this.awaiting) {
-      this.misses += 1;
-      if (this.misses >= MAX_MISSES) {
-        this.stop();
-        if (this.onLost) this.onLost();
-        else this.mux.ws.close(4002, "heartbeat lost");
-        return;
-      }
+    const ws = this.mux.ws;
+    if (!ws || ws.readyState === 2 || ws.readyState === 3) {
+      this._registerMiss();
+      return;
     }
+    if (ws.readyState !== 1) return;
+    if (!this.mux.send(CHANNELS.CONTROL, PING)) {
+      this._registerMiss();
+      return;
+    }
+    if (this.awaiting) this._registerMiss();
     this.awaiting = true;
     this.lastSentAt = Date.now();
+  }
+
+  _registerMiss() {
+    this.misses += 1;
+    if (this.misses >= MAX_MISSES) {
+      this.stop();
+      if (this.onLost) this.onLost();
+      else if (this.mux.ws) this.mux.ws.close(4002, "heartbeat lost");
+    }
   }
 }

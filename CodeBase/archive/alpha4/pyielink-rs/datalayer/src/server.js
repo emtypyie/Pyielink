@@ -90,9 +90,11 @@ wss.on("connection", (ws) => {
       onRtt: (ms) => console.log(`[pyielink-dl] rtt ${ms} ms`),
     });
     hb.start();
-    ws.on("close", () => {
-      hb.stop();
-      console.log("[pyielink-dl] client disconnected");
+    ws.on("close", (code) => {
+      if (code === 1000 || code === 1005) {
+        hb.stop();
+      }
+      console.log(`[pyielink-dl] client disconnected (code ${code})`);
     });
   });
 

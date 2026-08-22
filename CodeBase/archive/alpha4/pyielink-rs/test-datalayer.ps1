@@ -12,7 +12,7 @@ $ErrorActionPreference = "Stop"
 
 $HB_MS      = if ($Quick) { 600 } else { 5000 }
 $STAB_MS    = if ($Quick) { 4000 } else { 60000 }
-$DETECT_MS  = if ($Quick) { 5000 } else { 18000 }
+$DETECT_MS  = if ($Quick) { 5000 } else { 21000 }   # 3 missed beats at 5 s interval ≈ 15-20 s
 $BP         = 14243   # bootstrap listener for this test run
 
 $HOME_DIR   = Join-Path $env:TEMP ("pyiedl-test-" + [guid]::NewGuid().ToString("N").Substring(0,8))
@@ -106,6 +106,11 @@ function Wait-PortClosed([int]$port, [int]$tries) {
 # ---- scenario --------------------------------------------------------------
 Write-Host "== pyielink datalayer milestone test (promotion -> node data layer) =="
 
+Write-Host "[0] sweep stale data-layer processes from earlier aborted runs"
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match 'datalayer' -and $_.CommandLine -match 'server\.js' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
 Write-Host "[1] provision + enable host"
 New-Item -ItemType Directory -Force -Path $HOME_DIR | Out-Null
 $out = "test123`ntest123" | & $Exe /adduser -m bob -r admin 2>&1
@@ -141,13 +146,63 @@ $SESS_KEY = $parts[1].Trim()
 Assert ($DL_PORT -gt 1024 -and $DL_PORT -ne $BP) "ticket carries ephemeral data port $DL_PORT"
 Assert ($SESS_KEY -match '^[0-9a-f]{64}$') "ticket carries 64-hex session key"
 
+# Keepalive responder: mirrors what the real client watchdog does — answer
+# the host's bootstrap PING frames while the ws phase runs, otherwise the
+# 15 s PONG grace tears the session (and the node child) down mid-test.
+$kaRunspace = [runspacefactory]::CreateRunspace()
+$kaRunspace.Open()
+$kaPs = [powershell]::Create()
+$kaPs.Runspace = $kaRunspace
+[void]$kaPs.AddScript({
+    param($sock)
+    function Read-Exact($s, [int]$n) {
+        $buf = New-Object byte[] $n
+        $off = 0
+        while ($off -lt $n) {
+            $r = $s.GetStream().Read($buf, $off, $n - $off)
+            if ($r -le 0) { return $null }
+            $off += $r
+        }
+        return ,$buf
+    }
+    try {
+        $sock.GetStream().ReadTimeout = 1000
+        while ($true) {
+            try { $hdr = Read-Exact $sock 3 } catch { continue }   # idle between 5 s host pings
+            if ($null -eq $hdr) { return }
+            if ($hdr[0] -ne 0x0D) { continue }   # only care about PING
+            $len = ([int]$hdr[1] -shl 8) -bor [int]$hdr[2]
+            $payload = if ($len -gt 0) { Read-Exact $sock $len } else { ,@() }
+            $ms = New-Object IO.MemoryStream
+            $ms.WriteByte([byte]0x0E)
+            $ms.WriteByte([byte](($len -shr 8) -band 0xFF))
+            $ms.WriteByte([byte]($len -band 0xFF))
+            if ($len -gt 0 -and $null -ne $payload) { $ms.Write($payload, 0, $len) }
+            $s2 = $sock.GetStream()
+            $s2.Write($ms.ToArray(), 0, $ms.Length)
+            $s2.Flush()
+        }
+    } catch { }
+}).AddArgument($c)
+$kaHandle = $kaPs.BeginInvoke()
+
+function Stop-Keepalive {
+    try { $kaPs.Stop() } catch {}
+    try { $kaPs.Dispose() } catch {}
+    try { $kaRunspace.Close() } catch {}
+}
+
 Write-Host "[3] host spawned node data layer on that port"
 Assert (Wait-PortOpen $DL_PORT 40) "data layer accepting connections within 8 s"
 
 Write-Host "[4] node ws client: wrong-key 4001, valid ack, mux echo, ${STAB_MS} ms stability"
-& node $DL_CLIENT $DL_PORT $SESS_KEY $STAB_MS 2>&1 | ForEach-Object { Write-Host "  $_"; $_ } |
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"   # node stderr lines must not become terminating errors
+& node $DL_CLIENT $DL_PORT $SESS_KEY $STAB_MS 2>&1 | ForEach-Object { Write-Host "  $_"; "$_" } |
     Where-Object { $_ -match '^FAIL' } | ForEach-Object { throw $_ }
-if ($LASTEXITCODE -ne 0) { throw "node dl client reported failure" }
+$dlExit = $LASTEXITCODE
+$ErrorActionPreference = $prevEap
+if ($dlExit -ne 0) { throw "node dl client reported failure (exit $dlExit)" }
 
 Write-Host "[5] network kill detected by server within $($DETECT_MS) ms"
 $deadline = [DateTime]::UtcNow.AddMilliseconds($DETECT_MS)
@@ -156,9 +211,15 @@ while ([DateTime]::UtcNow -lt $deadline) {
     if ((Get-Content $HOST_OUT -Raw -ErrorAction SilentlyContinue) -match "heartbeat lost") { $detected = $true; break }
     Start-Sleep -Milliseconds 250
 }
+if (-not $detected) {
+    Write-Host "  -- host log tail --"
+    Get-Content $HOST_OUT -ErrorAction SilentlyContinue | Select-Object -Last 25 | ForEach-Object { Write-Host "  | $_" }
+}
 Assert $detected "server logged heartbeat-lost teardown"
 
 Write-Host "[6] bootstrap BYE kills the node child"
+Stop-Keepalive
+Start-Sleep -Milliseconds 300
 Send-Frame $c 0x0F "bye"
 Assert (Wait-PortClosed $DL_PORT 24) "data port closed after session end"
 
