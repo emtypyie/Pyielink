@@ -1,0 +1,34 @@
+# pyielink connector client — resilient daemon
+#
+# One-time interactive bootstrap (accept license, type password once):
+#   docker compose run --rm connector
+#
+# Then run as a self-healing daemon (reconnects forever, survives reboots):
+#   PYIELINK_TARGET=bob@192.168.1.50 PYIELINK_ACCEPT_LICENSE=1 docker compose up -d
+#
+# Attach to the remote terminal of a running session:
+#   docker attach $(docker compose ps -q connector)
+
+services:
+  connector:
+    build: .
+    image: pyielink-connector:latest
+    container_name: pyielink-connector
+    restart: unless-stopped
+    init: true
+    stdin_open: true
+    tty: true
+    environment:
+      # user@ip of the host to stay connected to
+      - PYIELINK_TARGET=${PYIELINK_TARGET:?set PYIELINK_TARGET=user@host-ip in .env or shell}
+      # setting this = you accept the ethics agreement inside the container
+      - PYIELINK_ACCEPT_LICENSE=${PYIELINK_ACCEPT_LICENSE:-0}
+      # keep the remote terminal attached to this TTY
+      - PYIELINK_SHELL=1
+      - PYIELINK_RETRY_SECONDS=${PYIELINK_RETRY_SECONDS:-5}
+    volumes:
+      # credential store survives container recreation/rebuilds
+      - connector-data:/data
+
+volumes:
+  connector-data:
