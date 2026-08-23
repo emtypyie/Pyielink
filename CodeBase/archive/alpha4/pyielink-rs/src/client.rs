@@ -228,17 +228,19 @@ fn now_ms() -> u128 {
 }
 
 /// Shared authentication logic: performs handshake, challenge-response, license, and promotion.
-/// Returns (data_port, session_key, SessionState, addr).
+/// Returns (data_port, session_key, SessionState, addr, bootstrap stream).
+/// The returned stream must stay open: the host serves heartbeats on it and
+/// tears the data layer down as soon as it dies.
 fn authenticate(
     target: &str,
-) -> Result<(String, String, SessionState, String), String> {
+) -> Result<(String, String, SessionState, String, std::net::TcpStream), String> {
     let (user, ip) = parse_target(target)?;
     let port: u16 = std::env::var("PYIELINK_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(BOOTSTRAP_PORT);
     let addr = format!("{}:{}", ip, port);
-    
+
     let mut stream = TcpStream::connect(&addr)
         .map_err(|e| format!("cannot reach {} — is the host running /enable? ({})", addr, e))?;
     stream.set_nodelay(true).map_err(|e| e.to_string())?;
@@ -251,6 +253,7 @@ fn authenticate(
     let mut sent_token_proof = false;
     let mut attempts = 0u32;
     let mut session_state: Option<SessionState> = None;
+    let mut keep_stream: Option<std::net::TcpStream> = None;
 
     loop {
         // Authenticate / re-authenticate
@@ -327,6 +330,7 @@ fn authenticate(
                             "  [ok] session re-promoted. data layer ready on {}:{}. session key received.",
                             state.ip, data_port
                         );
+                        keep_stream = Some(auth_stream);
                         break (data_port, session_key);
                     }
                     (AUTH_FAIL, payload) => {
@@ -421,6 +425,7 @@ fn authenticate(
                             "  [ok] session promoted. data layer ready on {}:{}. session key received.",
                             ip, data_port
                         );
+                        keep_stream = Some(stream);
                         break (data_port, session_key);
                     }
                     (AUTH_FAIL, payload) => {
@@ -445,7 +450,9 @@ fn authenticate(
         }
 
         let session_state = session_state.unwrap();
-        return Ok((data_port, session_key, session_state, addr));
+        let stream = keep_stream
+            .ok_or_else(|| "internal: authenticated without a live bootstrap stream".to_string())?;
+        return Ok((data_port, session_key, session_state, addr, stream));
     }
 }
 
@@ -501,7 +508,7 @@ pub fn run_gui_session(
         .map_err(|e| format!("handshake send failed: {}", e))?;
 
     // Use shared authentication function
-    let (data_port, session_key, session_state, addr) = authenticate(target)?;
+    let (data_port, session_key, session_state, addr, _bootstrap) = authenticate(target)?;
 
     let session_state_arc = Arc::new(std::sync::Mutex::new(session_state));
     let dl_state = Arc::new(AtomicU8::new(DL_CONNECTING));
