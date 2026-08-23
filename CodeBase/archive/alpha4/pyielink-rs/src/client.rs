@@ -1824,6 +1824,7 @@ fn post_auth_loop(
     input_running: &Arc<AtomicBool>,
     input_handle: &mut Option<std::thread::JoinHandle<()>>,
 ) -> Result<(), String> {
+    eprintln!("[dbg] post_auth_loop start interactive={}", interactive);
     let mut stdin_rx = if interactive { Some(spawn_stdin_reader()) } else { None };
     let mut stdin_done = false;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
@@ -1914,6 +1915,7 @@ fn post_auth_loop(
         }
         match proto::read_frame(stream) {
             Ok((PING, payload)) => {
+                eprintln!("[dbg] post_auth_loop got PING");
                 last_ping_seen = Instant::now();
                 if let Ok(sent) = String::from_utf8_lossy(&payload).trim().parse::<u128>() {
                     println!("  [hb] rtt {}ms", now_ms().saturating_sub(sent));
@@ -1964,6 +1966,7 @@ fn post_auth_loop(
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 if dl_state.load(Ordering::Relaxed) == DL_DEAD {
+                    eprintln!("[dbg] post_auth_loop exit: dl dead");
                     let _ = proto::write_frame(stream, BYE, b"data-link lost");
                     return Err("data link died — session ended".into());
                 }
@@ -1973,11 +1976,15 @@ fn post_auth_loop(
                     return Ok(());
                 }
                 if last_ping_seen.elapsed() >= HB_STALE {
+                    eprintln!("[dbg] post_auth_loop exit: hb stale");
                     let _ = proto::write_frame(stream, BYE, b"stall");
                     return Err("host stopped responding to heartbeats".into());
                 }
             }
-            Err(_) => return Err("connection lost".into()),
+            Err(_) => {
+                eprintln!("[dbg] post_auth_loop exit: read error");
+                return Err("connection lost".into())
+            }
         }
     }
 }

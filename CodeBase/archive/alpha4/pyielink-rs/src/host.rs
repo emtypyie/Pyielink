@@ -494,8 +494,8 @@ fn spawn_datalayer(
         .arg(port.to_string())
         .env("PYIELINK_SESSION", &handoff)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
     {
         Ok(mut child) => {
