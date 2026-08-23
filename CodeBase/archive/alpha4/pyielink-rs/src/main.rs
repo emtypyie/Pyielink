@@ -25,24 +25,36 @@ fn usage() -> String {
     format!(
         "pyielink v{} — emtypyie remote access framework\n\n\
          USAGE:\n\
-         \x20 pyielink                     interactive launcher\n\
-         \x20 pyielink <user>@<ip>         connect to a remote host (interactive session)\n\
-         \x20 pyielink get <user>@<ip> <remote> [local]\n\
-         \x20                              download a file from the host, then exit\n\
-         \x20 pyielink put <user>@<ip> <local> [remote]\n\
-         \x20                              upload a file to the host, then exit\n\
-          \x20 pyielink /enable [--port N]  open this device for connections (default port {})\n\
-           \x20 pyielink /adduser -m <name> [-r user|admin]\n\
-           \x20                              create a local account (admin may run 'sudo' remotely)\n\
-         \x20 pyielink -h | --help         this help\n\
-         \x20 pyielink -v | --version      version",
+          \x20 pyielink                     interactive launcher\n\
+          \x20 pyielink <user>@<ip>         connect to a remote host (GUI by default)\n\
+          \x20 pyielink --repl <user>@<ip>  connect to a remote host (REPL terminal mode)\n\
+          \x20 pyielink get <user>@<ip> <remote> [local]\n\
+          \x20                              download a file from the host, then exit\n\
+          \x20 pyielink put <user>@<ip> <local> [remote]\n\
+          \x20                              upload a file to the host, then exit\n\
+           \x20 pyielink /enable [--port N]  open this device for connections (default port {})\n\
+            \x20 pyielink /adduser -m <name> [-r user|admin]\n\
+            \x20                              create a local account (admin may run 'sudo' remotely)\n\
+          \x20 pyielink -h | --help         this help\n\
+          \x20 pyielink -v | --version      version",
         env!("CARGO_PKG_VERSION"),
         DEFAULT_PORT
     )
 }
 
 fn run(args: Vec<String>) -> Result<(), String> {
-    match args.first().map(|s| s.as_str()) {
+    // Parse --repl flag if present
+    let mut repl_mode = false;
+    let mut filtered_args = Vec::new();
+    for arg in args {
+        if arg == "--repl" {
+            repl_mode = true;
+        } else {
+            filtered_args.push(arg);
+        }
+    }
+    
+    match filtered_args.first().map(|s| s.as_str()) {
         None => launcher(),
         Some("-h" | "--help" | "/help") => {
             println!("{}", usage());
@@ -52,25 +64,25 @@ fn run(args: Vec<String>) -> Result<(), String> {
             println!("pyielink v{}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Some(a) if a.contains('@') => client::run_connect(a),
+        Some(a) if a.contains('@') => client::run_connect(a, repl_mode),
         Some("get") => {
             // get <user>@<ip> <remote> [local]
-            match args.len() {
-                3 => client::run_get(&args[1], &args[2], None),
-                4 => client::run_get(&args[1], &args[2], Some(&args[3])),
+            match filtered_args.len() {
+                3 => client::run_get(&filtered_args[1], &filtered_args[2], None),
+                4 => client::run_get(&filtered_args[1], &filtered_args[2], Some(&filtered_args[3])),
                 _ => Err("usage: pyielink get <user>@<ip> <remote> [local]".into()),
             }
         }
         Some("put") => {
             // put <user>@<ip> <local> [remote]
-            match args.len() {
-                3 => client::run_put(&args[1], &args[2], None),
-                4 => client::run_put(&args[1], &args[2], Some(&args[3])),
+            match filtered_args.len() {
+                3 => client::run_put(&filtered_args[1], &filtered_args[2], None),
+                4 => client::run_put(&filtered_args[1], &filtered_args[2], Some(&filtered_args[3])),
                 _ => Err("usage: pyielink put <user>@<ip> <local> [remote]".into()),
             }
         }
         Some("/enable") => {
-            let port = parse_port(args.get(2))?; // /enable --port N
+            let port = parse_port(filtered_args.get(2))?; // /enable --port N
             cmd_enable_and_listen(port)
         }
         Some("/adduser") => {
@@ -78,14 +90,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let mut role = String::from("user");
             let usage = "usage: pyielink /adduser -m <username> [-r user|admin]";
             let mut i = 1;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "-m" if i + 1 < args.len() => {
-                        name = Some(args[i + 1].clone());
+            while i < filtered_args.len() {
+                match filtered_args[i].as_str() {
+                    "-m" if i + 1 < filtered_args.len() => {
+                        name = Some(filtered_args[i + 1].clone());
                         i += 2;
                     }
-                    "-r" if i + 1 < args.len() => {
-                        role = args[i + 1].clone();
+                    "-r" if i + 1 < filtered_args.len() => {
+                        role = filtered_args[i + 1].clone();
                         i += 2;
                     }
                     _ => return Err(usage.into()),
@@ -140,7 +152,7 @@ fn launcher() -> Result<(), String> {
                 if target.is_empty() {
                     continue;
                 }
-                if let Err(e) = client::run_connect(&target) {
+                if let Err(e) = client::run_connect(&target, false) {
                     eprintln!("  [err] {}", e);
                 }
             }
@@ -164,4 +176,87 @@ fn launcher() -> Result<(), String> {
             other => println!("  unknown choice '{}'", other),
         }
     }
+}
+
+fn parse_port(arg: Option<&String>) -> Result<u16, String> {
+    match arg.map(|s| s.as_str()) {
+        None => Ok(DEFAULT_PORT),
+        Some(p) => p
+            .parse::<u16>()
+            .map_err(|_| format!("invalid port '{}'", p)),
+    }
+}
+
+fn cmd_enable_and_listen(port: u16) -> Result<(), String> {
+    creds::cmd_enable()?;
+    println!("  [ok] remote access enabled.");
+    host::listen(port)
+}
+
+/* ---- interactive launcher: the /pyielink entry path (no args forwarded) ---- */
+
+const BANNER: &str = include_str!("banner.txt");
+
+fn launcher() -> Result<(), String> {
+    loop {
+        println!("{}", BANNER);
+        println!("pyielink v{} — emtypyie remote access framework", env!("CARGO_PKG_VERSION"));
+        println!("  [1] Connect to a host");
+        println!("  [2] Enable remote access on this device");
+        println!("  [3] Add a local user account");
+        println!("  [0] Exit");
+        print!("choice> ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return Ok(());
+        }
+        match line.trim() {
+            "0" | "" => return Ok(()),
+            "1" => {
+                let target = creds::read_line_prompt("connect as user@ip: ");
+                if target.is_empty() {
+                    continue;
+                }
+                if let Err(e) = client::run_connect(&target, false) {
+                    eprintln!("  [err] {}", e);
+                }
+            }
+            "2" => {
+                if let Err(e) = cmd_enable_and_listen(DEFAULT_PORT) {
+                    eprintln!("  [err] {}", e);
+                    continue;
+                }
+                return Ok(());
+            }
+            "3" => {
+                let name = creds::read_line_prompt("new username: ");
+                if name.is_empty() {
+                    continue;
+                }
+                let role = creds::read_line_prompt("role [user/admin, enter = user]: ");
+                if let Err(e) = creds::add_user(&name, &role) {
+                    eprintln!("  [err] {}", e);
+                }
+            }
+            other => println!("  unknown choice '{}'", other),
+        }
+    }
+}
+
+fn parse_port(arg: Option<&String>) -> Result<u16, String> {
+    match arg.map(|s| s.as_str()) {
+        None => Ok(DEFAULT_PORT),
+        Some(p) => p
+            .parse::<u16>()
+            .map_err(|_| format!("invalid port '{}'", p)),
+    }
+}
+
+fn cmd_enable_and_listen(port: u16) -> Result<(), String> {
+    creds::cmd_enable()?;
+    println!("  [ok] remote access enabled.");
+    host::listen(port)
 }

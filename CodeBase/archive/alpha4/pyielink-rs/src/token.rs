@@ -1,5 +1,9 @@
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const TOKEN_LEN_BYTES: usize = 32;
 
@@ -34,7 +38,7 @@ pub fn hash_token(token_hex: &str) -> String {
 }
 
 /// Root of all pyielink local state. PYIELINK_HOME overrides the default
-/// ~/.pyielink so containers can mount a volume (and tests can isolate).
+/// ~/.pyielink so containers can mount a volume (tests can isolate).
 pub fn pyielink_dir() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("PYIELINK_HOME") {
         if !p.is_empty() {
@@ -61,21 +65,104 @@ pub fn client_token_path(user: &str, ip: &str) -> std::path::PathBuf {
     tokens_dir().join(format!("{}@{}", sanitize(user), sanitize(ip)))
 }
 
-pub fn save_client_token(user: &str, ip: &str, token: &str) -> std::io::Result<std::path::PathBuf> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenRecord {
+    pub token_hash: String,
+    pub created_at: u64,
+    pub last_used_at: u64,
+    pub user: String,
+    pub ip: String,
+}
+
+impl TokenRecord {
+    pub fn new(user: String, ip: String, token_hash: String) -> Self {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        Self {
+            token_hash,
+            created_at: now,
+            last_used_at: now,
+            user,
+            ip,
+        }
+    }
+}
+
+fn ensure_tokens_dir() -> io::Result<()> {
     let dir = tokens_dir();
-    std::fs::create_dir_all(&dir)?;
+    if !dir.exists() {
+        fs::create_dir_all(&dir)?;
+    }
+    Ok(())
+}
+
+pub fn save_client_token(user: &str, ip: &str, token_hash: &str) -> io::Result<std::path::PathBuf> {
+    ensure_tokens_dir()?;
     let path = client_token_path(user, ip);
+    let record = TokenRecord::new(user.to_string(), ip.to_string(), token_hash.to_string());
+    let json = serde_json::to_string_pretty(&record)?;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, token)?;
-    std::fs::rename(&tmp, &path)?;
+    fs::write(&tmp, json)?;
+    fs::rename(&tmp, &path)?;
     Ok(path)
 }
 
 pub fn load_client_token(user: &str, ip: &str) -> Option<String> {
-    std::fs::read_to_string(client_token_path(user, ip))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    let path = client_token_path(user, ip);
+    if !path.exists() {
+        return None;
+    }
+    let content = fs::read_to_string(&path).ok()?;
+    // Try new JSON format first
+    if let Ok(record) = serde_json::from_str::<TokenRecord>(&content) {
+        // Update last_used_at
+        let mut record = record;
+        record.last_used_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let _ = save_client_token(&record.user, &record.ip, &record.token_hash);
+        return Some(record.token_hash);
+    }
+    // Fallback to legacy format (raw hash)
+    let content = content.trim().to_string();
+    if !content.is_empty() && content.len() == 64 && content.bytes().all(|b| b.is_ascii_hexdigit()) {
+        // Upgrade to new format
+        let _ = save_client_token(user, ip, &content);
+        return Some(content);
+    }
+    None
+}
+
+pub fn delete_client_token(user: &str, ip: &str) -> io::Result<()> {
+    let path = client_token_path(user, ip);
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
+pub fn list_client_tokens() -> Vec<TokenRecord> {
+    let dir = tokens_dir();
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut tokens = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(content) = fs::read_to_string(entry.path()) {
+                if let Ok(record) = serde_json::from_str::<TokenRecord>(&content) {
+                    tokens.push(record);
+                }
+            }
+        }
+    }
+    tokens
+}
+
+pub fn verify_token(user: &str, ip: &str, token: &str) -> bool {
+    if let Some(stored_hash) = load_client_token(user, ip) {
+        let provided_hash = hash_token(token);
+        stored_hash == provided_hash
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]

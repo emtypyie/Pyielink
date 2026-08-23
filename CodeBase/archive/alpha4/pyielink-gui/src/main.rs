@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use eframe::egui::{self, RichText};
+use std::time::Instant;
+use eframe::egui::{self, RichText, Color32};
 use pyielink::client::{run_gui_session, InputEvent, video_control_sender, DlCommand};
 
 mod video_decoder;
@@ -185,11 +186,114 @@ impl ViewerApp {
         self.connected = true;
     }
 
-    fn toggle_input(&mut self) {
+fn toggle_input(&mut self) {
         self.input_running = !self.input_running;
+        self.input_active = self.input_running;
+        if let Some(ref tx) = self.video_ctrl_tx {
+            if self.input_running {
+                let _ = tx.send(DlCommand::InputStart);
+            } else {
+                let _ = tx.send(DlCommand::InputStop);
+            }
+        }
+    }
+
+    fn render_osd_overlay(&mut self, ui: &mut egui::Ui, video_rect: &egui::Rect) {
+        // Update FPS counter
+        let now = Instant::now();
+        self.frame_count += 1;
+        if now.duration_since(self.last_fps_update).as_secs_f32() >= 1.0 {
+            self.fps = self.frame_count as f32 / now.duration_since(self.last_fps_update).as_secs_f32();
+            self.frame_count = 0;
+            self.last_fps_update = now;
+            
+            // Update decoder stats if available
+            if let Ok(decoder) = self.decoder.lock() {
+                let (dropped, duplicated) = decoder.frame_stats();
+                self.frames_dropped = dropped;
+                self.frames_duplicated = duplicated;
+            }
+        }
+        
+        // Render OSD in top-left corner of video
+        let osd_rect = egui::Rect::from_min_size(
+            video_rect.min + egui::vec2(10.0, 10.0),
+            egui::vec2(280.0, 160.0)
+        );
+        
+        egui::Area::new("osd_overlay".into())
+            .fixed_pos(osd_rect.min)
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgba_premultiplied(0, 0, 0, 180))
+                    .rounding(egui::Rounding::same(6.0))
+                    .inner_margin(egui::Margin::same(8.0))
+                    .show(ui, |ui| {
+                        ui.set_min_width(260.0);
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new("PYIELINK OSD").strong().size(14.0).color(Color32::from_rgb(100, 255, 100)));
+                            ui.separator();
+                            
+                            // FPS
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("FPS:").size(12.0));
+                                let fps_color = if self.fps >= 25.0 { Color32::GREEN } else if self.fps >= 15.0 { Color32::YELLOW } else { Color32::RED };
+                                ui.label(RichText::new(format!("{:.1}", self.fps)).size(12.0).color(fps_color).strong());
+                            });
+                            
+                            // Bitrate
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Bitrate:").size(12.0));
+                                ui.label(RichText::new(format!("{} kbps", self.bitrate_kbps)).size(12.0).strong());
+                            });
+                            
+                            // RTT
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("RTT:").size(12.0));
+                                let rtt_color = if self.rtt_ms < 50 { Color32::GREEN } else if self.rtt_ms < 100 { Color32::YELLOW } else { Color32::RED };
+                                ui.label(RichText::new(format!("{} ms", self.rtt_ms)).size(12.0).color(rtt_color).strong());
+                            });
+                            
+                            // Input status
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Input:").size(12.0));
+                                let (status_text, status_color) = if self.input_active {
+                                    ("ACTIVE", Color32::GREEN)
+                                } else {
+                                    ("INACTIVE", Color32::GRAY)
+                                };
+                                ui.label(RichText::new(status_text).size(12.0).color(status_color).strong());
+                            });
+                            
+                            // Frame stats
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Dropped:").size(12.0));
+                                ui.label(RichText::new(format!("{}", self.frames_dropped)).size(12.0).color(Color32::RED).strong());
+                                ui.label(RichText::new("  Dup:").size(12.0));
+                                ui.label(RichText::new(format!("{}", self.frames_duplicated)).size(12.0).color(Color32::YELLOW).strong());
+                            });
+                            
+                            // Connection status
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Status:").size(12.0));
+                                let (conn_text, conn_color) = if self.connected {
+                                    ("CONNECTED", Color32::GREEN)
+                                } else {
+                                    ("DISCONNECTED", Color32::RED)
+                                };
+                                ui.label(RichText::new(conn_text).size(12.0).color(conn_color).strong());
+                            });
+                            
+                            // Toggle hint
+                            ui.separator();
+                            ui.label(RichText::new("[F1] Toggle OSD  [F2] Toggle Input").size(10.0).color(Color32::GRAY));
+                        });
+                    });
+            });
     }
 }
-
 impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if !self.connected && !self.show_monitor_selector {
@@ -340,6 +444,19 @@ impl eframe::App for ViewerApp {
                     egui::Event::Key { key, pressed, .. } => {
                         let vk = key_to_vk(*key);
                         let flags = if *pressed { 0 } else { 0x0002 };
+                        
+                        // Handle OSD hotkeys
+                        if *pressed {
+                            match key {
+                                egui::Key::F1 => {
+                                    self.osd_visible = !self.osd_visible;
+                                }
+                                egui::Key::F2 => {
+                                    self.toggle_input();
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                     egui::Event::PointerButton { pos, button, pressed, .. } => {
                     }
