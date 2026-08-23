@@ -1824,7 +1824,8 @@ fn post_auth_loop(
     input_running: &Arc<AtomicBool>,
     input_handle: &mut Option<std::thread::JoinHandle<()>>,
 ) -> Result<(), String> {
-    let stdin_rx = if interactive { Some(spawn_stdin_reader()) } else { None };
+    let mut stdin_rx = if interactive { Some(spawn_stdin_reader()) } else { None };
+    let mut stdin_done = false;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
     let mut last_ping_seen = Instant::now();
     let mut awaiting_result = false;
@@ -1833,17 +1834,23 @@ fn post_auth_loop(
             while let Ok(m) = rx.try_recv() {
                 match m {
                     StdinMsg::Eof => {
-                        if interactive {
-                            println!();
-                        }
-                        if input_running.load(Ordering::Relaxed) {
-                            input_running.store(false, Ordering::Relaxed);
-                            if let Some(h) = input_handle.take() {
-                                let _ = h.join();
+                        if creds::stdin_is_tty() {
+                            if interactive {
+                                println!();
                             }
+                            if input_running.load(Ordering::Relaxed) {
+                                input_running.store(false, Ordering::Relaxed);
+                                if let Some(h) = input_handle.take() {
+                                    let _ = h.join();
+                                }
+                            }
+                            let _ = proto::write_frame(stream, BYE, b"");
+                            return Ok(());
                         }
-                        let _ = proto::write_frame(stream, BYE, b"");
-                        return Ok(());
+                        // Piped stdin closed (e.g. test harness): keep the
+                        // session (and data link) alive instead of hanging up.
+                        stdin_done = true;
+                        break;
                     }
                     StdinMsg::Line(l) => {
                         let l = l.trim();
@@ -1901,6 +1908,9 @@ fn post_auth_loop(
                     }
                 }
             }
+        }
+        if stdin_done {
+            stdin_rx = None;
         }
         match proto::read_frame(stream) {
             Ok((PING, payload)) => {

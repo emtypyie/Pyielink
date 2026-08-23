@@ -330,6 +330,7 @@ fn session_loop(
         // heartbeat when due
         if last_ping_sent.elapsed() >= PING_INTERVAL {
             if proto::write_frame(stream, PING, now_ms().to_string().as_bytes()).is_err() {
+                eprintln!("[dbg] session_loop break: ping write failed");
                 break;
             }
             last_ping_sent = Instant::now();
@@ -338,6 +339,7 @@ fn session_loop(
             Ok((PONG, _)) => {
                 last_pong = Instant::now();
                 if !sessions::touch(session_key) {
+                    eprintln!("[dbg] session_loop break: touch failed");
                     break;
                 }
             }
@@ -348,6 +350,7 @@ fn session_loop(
             }
             Ok((BYE, _)) => {
                 println!("  [bye] {} closed the session cleanly", user);
+                eprintln!("[dbg] session_loop break: BYE");
                 break;
             }
             Ok((EXEC_REQ, payload)) => {
@@ -390,16 +393,27 @@ fn session_loop(
             {
                 if last_pong.elapsed() >= PONG_GRACE {
                     println!("  [lost] {} missed heartbeats — closing session", user);
+                    eprintln!("[dbg] session_loop break: pong grace");
                     break;
                 }
             }
-            Err(_) => break, // connection dead
+            Err(_) => {
+                eprintln!("[dbg] session_loop break: read error");
+                break;
+            } // connection dead
         }
     }
     sessions::close(session_key);
     if let Some(child) = datalayer {
-        let _ = child.kill();
-        let _ = child.wait();
+        match child.try_wait() {
+            Ok(Some(s)) => eprintln!("[dbg] data layer already exited before kill: {:?}", s),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("[dbg] data layer killed by host");
+            }
+            Err(e) => eprintln!("[dbg] data layer try_wait err: {}", e),
+        }
         println!("  [dl] data layer for '{}' stopped", user);
     }
 }
