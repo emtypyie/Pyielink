@@ -6,6 +6,7 @@ export const CHANNELS = Object.freeze({
   VIDEO: 0x03,
   FILE_META: 0x04,
   FILE_CHUNK: 0x05,
+  AUDIO: 0x06,
 });
 
 const HEADER = 5;

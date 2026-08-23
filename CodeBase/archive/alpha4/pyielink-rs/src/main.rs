@@ -1,6 +1,7 @@
 mod client;
 mod creds;
 mod host;
+mod input;
 mod proto;
 mod sessions;
 mod token;

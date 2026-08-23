@@ -3,11 +3,26 @@ name = "pyielink"
 version = "0.1.0-alpha.4"
 edition = "2024"
 
+[lib]
+name = "pyielink"
+path = "src/lib.rs"
+
 [dependencies]
 rand = "0.8"
 sha2 = "0.10"
 aes-gcm = "0.10"
 tungstenite = "0.24"
+windows = { version = "0.58", features = [
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rusty-opus = "0.9"
+rodio = "0.19"
+cpal = "0.14"
 
 [profile.release]
 opt-level = "s"

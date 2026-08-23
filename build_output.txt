@@ -1,0 +1,170 @@
+﻿cargo : warning: unused variable: `xfer_tx`
+At line:1 char:1
++ cargo build 2>&1 | Out-File D:\EMTYPYIE\Pyielink\build_output.txt -En ...
++ ~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: unused variable: `xfer_tx`:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+   --> D:\EMTYPYIE\Pyielink\CodeBase\archive\alpha4\pyielink-rs\src\client.rs:263:22
+    |
+263 |                 let (xfer_tx, xfer_rx) = mpsc::channel::<DlCommand>();
+    |                      ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_xfer_tx`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning[E0133]: dereference of raw pointer is unsafe and requires unsafe block
+  --> D:\EMTYPYIE\Pyielink\CodeBase\archive\alpha4\pyielink-rs\src\input.rs:71:32
+   |
+71 |                     let kbd = &*(l_param.0 as *const KBDLLHOOKSTRUCT);
+   |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ dereference of raw pointer
+   |
+   = note: raw pointers may be null, dangling or unaligned; they can violate aliasing rules and cause data races: all 
+of these are undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+  --> D:\EMTYPYIE\Pyielink\CodeBase\archive\alpha4\pyielink-rs\src\input.rs:66:1
+   |
+66 | unsafe extern "system" fn keyboard_hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+   = note: `#[warn(unsafe_op_in_unsafe_fn)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+warning[E0133]: call to unsafe function `windows::Win32::UI::WindowsAndMessaging::CallNextHookEx` is unsafe and 
+requires unsafe block
+  --> D:\EMTYPYIE\Pyielink\CodeBase\archive\alpha4\pyielink-rs\src\input.rs:87:5
+   |
+87 |     CallNextHookEx(None, n_code, w_param, l_param)
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+   |
+   = note: consult the function's documentation for information on how to avoid undefined behavior
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+warning[E0133]: dereference of raw pointer is unsafe and requires unsafe block
+  --> D:\EMTYPYIE\Pyielink\CodeBase\archive\alpha4\pyielink-rs\src\input.rs:95:34
+   |
+95 |                     let mouse = &*(l_param.0 as *const MSLLHOOKSTRUCT);
+   |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ dereference of raw pointer
+   |
+   = note: raw pointers may be null, dangling or unaligned; they can violate aliasing rules and cause data races: all 
+of these are undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+  --> D:\EMTYPYIE\Pyielink\CodeBase\archive\alpha4\pyielink-rs\src\input.rs:90:1
+   |
+90 | unsafe extern "system" fn mouse_hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+warning[E0133]: call to unsafe function `windows::Win32::UI::WindowsAndMessaging::CallNextHookEx` is unsafe and 
+requires unsafe block
+   --> D:\EMTYPYIE\Pyielink\CodeBase\archive\alpha4\pyielink-rs\src\input.rs:119:36
+    |
+119 | ...                   return CallNextHookEx(None, n_code, w_param, l_param);
+    |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+    |
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+warning[E0133]: call to unsafe function `windows::Win32::UI::WindowsAndMessaging::CallNextHookEx` is unsafe and 
+requires unsafe block
+   --> D:\EMTYPYIE\Pyielink\CodeBase\archive\alpha4\pyielink-rs\src\input.rs:128:5
+    |
+128 |     CallNextHookEx(None, n_code, w_param, l_param)
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+    |
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+For more information about this error, try `rustc --explain E0133`.
+warning: `pyielink` (lib) generated 6 warnings (run `cargo fix --lib -p pyielink` to apply 3 suggestions)
+   Compiling pyielink-gui v0.1.0-alpha.4 (D:\EMTYPYIE\Pyielink\CodeBase\archive\alpha4\pyielink-gui)
+warning: unused import: `Mutex`
+ --> src\main.rs:1:22
+  |
+1 | use std::sync::{Arc, Mutex};
+  |                      ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `InputEvent`
+ --> src\main.rs:3:41
+  |
+3 | use pyielink::client::{run_gui_session, InputEvent};
+  |                                         ^^^^^^^^^^
+
+warning: unused import: `Texture`
+ --> src\video_decoder.rs:4:27
+  |
+4 | use wgpu::{Device, Queue, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, Extent3d, 
+ImageCopyTexture, Ori...
+  |                           ^^^^^^^
+
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+  --> src\main.rs:29:25
+   |
+29 |             Ok(Box::new(ViewerApp::new(target)))
+   |                         ^^^^^^^^^^^^^^ ------ argument #1 of type `&CreationContext<'_>` is missing
+   |
+note: associated function defined here
+  --> src\main.rs:45:8
+   |
+45 |     fn new(cc: &eframe::CreationContext<'_>, target: String) -> Self {
+   |        ^^^ --------------------------------
+help: provide the argument
+   |
+29 |             Ok(Box::new(ViewerApp::new(/* &CreationContext<'_> */, target)))
+   |                                        +++++++++++++++++++++++++++
+
+warning: unused variable: `cc`
+  --> src\main.rs:45:12
+   |
+45 |     fn new(cc: &eframe::CreationContext<'_>, target: String) -> Self {
+   |            ^^ help: if this is intentional, prefix it with an underscore: `_cc`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `frame`
+  --> src\main.rs:79:47
+   |
+79 |     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+   |                                               ^^^^^ help: if this is intentional, prefix it with an underscore: 
+`_frame`
+
+warning: unused variable: `vk`
+   --> src\main.rs:108:29
+    |
+108 |                         let vk = key_to_vk(*key);
+    |                             ^^ help: if this is intentional, prefix it with an underscore: `_vk`
+
+warning: unused variable: `flags`
+   --> src\main.rs:109:29
+    |
+109 |                         let flags = if *pressed { 0 } else { 0x0002 };
+    |                             ^^^^^ help: if this is intentional, prefix it with an underscore: `_flags`
+
+warning: unused variable: `pos`
+   --> src\main.rs:111:50
+    |
+111 |                     egui::Event::PointerButton { pos, button, pressed, .. } => {
+    |                                                  ^^^ help: try ignoring the field: `pos: _`
+
+warning: unused variable: `button`
+   --> src\main.rs:111:55
+    |
+111 |                     egui::Event::PointerButton { pos, button, pressed, .. } => {
+    |                                                       ^^^^^^ help: try ignoring the field: `button: _`
+
+warning: unused variable: `pressed`
+   --> src\main.rs:111:63
+    |
+111 |                     egui::Event::PointerButton { pos, button, pressed, .. } => {
+    |                                                               ^^^^^^^ help: try ignoring the field: `pressed: _`
+
+warning: unused variable: `pos`
+   --> src\main.rs:113:47
+    |
+113 |                     egui::Event::PointerMoved(pos) => {
+    |                                               ^^^ help: if this is intentional, prefix it with an underscore: 
+`_pos`
+
+For more information about this error, try `rustc --explain E0061`.
+warning: `pyielink-gui` (bin "pyielink-gui") generated 11 warnings
+error: could not compile `pyielink-gui` (bin "pyielink-gui") due to 1 previous error; 11 warnings emitted

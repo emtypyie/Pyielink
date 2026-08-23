@@ -4,6 +4,9 @@ import { WebSocketServer } from "ws";
 import { Mux, keysMatch, CHANNELS } from "./mux.js";
 import { Heartbeat } from "./heartbeat.js";
 import { FileService } from "./files.js";
+import { InputService } from "./input.js";
+import { VideoService } from "./video.js";
+import { AudioService } from "./audio.js";
 
 const DEFAULT_PORT = 4243;
 const AUTH_WINDOW_MS = 10000;
@@ -92,12 +95,18 @@ wss.on("connection", (ws) => {
       onRtt: (ms) => console.log(`[pyielink-dl] rtt ${ms} ms`),
     });
     const files = new FileService(mux, session, (m) => console.log(m));
+    const input = new InputService(mux, session, (m) => console.log(m));
+    const video = new VideoService(mux, session, (m) => console.log(m));
+    const audio = new AudioService(mux, session, (m) => console.log(m));
     hb.start();
     ws.on("close", (code) => {
       if (code === 1000 || code === 1005) {
         hb.stop();
       }
       files.teardownAll();
+      input.stop();
+      video.stop();
+      audio.stop();
       console.log(`[pyielink-dl] client disconnected (code ${code})`);
     });
   });
