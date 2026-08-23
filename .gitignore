@@ -4,3 +4,4 @@ CodeBase/**/target/
 *_host_*.log
 _*.log
 PHASES.md
+*.txt
