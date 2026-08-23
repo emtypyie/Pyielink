@@ -8,6 +8,10 @@ import { InputService } from "./input.js";
 import { VideoService } from "./video.js";
 import { AudioService } from "./audio.js";
 
+process.on("uncaughtException", (e) => {
+  console.error(`[pyielink-dl] UNCAUGHT: ${e && e.stack ? e.stack : e}`);
+});
+
 const DEFAULT_PORT = 4243;
 const AUTH_WINDOW_MS = 10000;
 
@@ -58,6 +62,7 @@ console.log(
 );
 
 wss.on("connection", (ws) => {
+  console.log(`[pyielink-dl] client connection received`);
   let mux = null;
   let hb = null;
   let authed = false;

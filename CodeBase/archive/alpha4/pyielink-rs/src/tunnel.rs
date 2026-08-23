@@ -1,12 +1,12 @@
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::thread;
 use std::io::{BufRead, BufReader};
 
 const DEFAULT_TUNNEL_PORT: u16 = 4242;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TunnelConfig {
     pub enabled: bool,
     pub allow_all: bool,
@@ -16,6 +16,23 @@ pub struct TunnelConfig {
     pub local_port: u16,
     pub public_url: Option<String>,
     pub process: Option<std::process::Child>,
+}
+
+// `Child` is not `Clone`, so implement `Clone` manually and drop the
+// process handle (clones are used for read-only config snapshots).
+impl Clone for TunnelConfig {
+    fn clone(&self) -> Self {
+        Self {
+            enabled: self.enabled,
+            allow_all: self.allow_all,
+            whitelist: self.whitelist.clone(),
+            tunnel_type: self.tunnel_type.clone(),
+            tunnel_url: self.tunnel_url.clone(),
+            local_port: self.local_port,
+            public_url: self.public_url.clone(),
+            process: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -116,7 +133,7 @@ impl TunnelManager {
 
     async fn start_cloudflare_tunnel(&self, local_port: u16) -> Result<String, String> {
         // Try to use cloudflared
-        let output = Command::new("cloudflared")
+        let mut output = Command::new("cloudflared")
             .args(["tunnel", "--url", &format!("http://localhost:{}", local_port)])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -124,7 +141,7 @@ impl TunnelManager {
             .map_err(|e| format!("Failed to start cloudflared: {}", e))?;
 
         // Read stdout to get the tunnel URL
-        let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
+        let stdout = output.stdout.take().ok_or("Failed to capture stdout")?;
         let reader = BufReader::new(stdout);
         
         for line in BufReader::new(reader).lines() {
@@ -151,7 +168,7 @@ impl TunnelManager {
             .output()
             .map_err(|e| format!("Failed to start ngrok: {}", e))?;
 
-        let output_str = String::from_utf8_lossy(&stdout);
+        let output_str = String::from_utf8_lossy(&output.stdout);
         
         // Parse ngrok output for the public URL
         for line in output_str.lines() {

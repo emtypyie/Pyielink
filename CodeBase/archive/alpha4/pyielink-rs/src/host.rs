@@ -427,13 +427,17 @@ fn datalayer_script() -> Option<std::path::PathBuf> {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
+            // Running from <pkg>/bin/pyielink.exe: datalayer lives at <pkg>/datalayer.
+            if let Some(root) = dir.parent() {
+                bases.push(root.to_path_buf());
+            }
             bases.push(dir.to_path_buf());
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
         bases.push(cwd);
     }
-    bases.into_iter().map(|b| b.iter().collect::<std::path::PathBuf>()).find_map(|base| {
+    bases.into_iter().find_map(|base| {
         let p = REL.iter().fold(base, |acc, part| acc.join(part));
         if p.is_file() { Some(p) } else { None }
     })
@@ -442,7 +446,10 @@ fn datalayer_script() -> Option<std::path::PathBuf> {
 /// Grab an ephemeral loopback port for this session's data layer so
 /// concurrent/overlapping sessions never collide on a fixed port.
 fn pick_free_port() -> Option<u16> {
-    std::net::TcpListener::bind("127.0.0.1:0")
+    // Bind 0.0.0.0 so the reserved port is free on every interface — the data
+    // layer later binds 0.0.0.0:<port>, and a loopback-only reservation would
+    // collide with ports already held on a real interface.
+    std::net::TcpListener::bind("0.0.0.0:0")
         .ok()
         .and_then(|l| l.local_addr().ok())
         .map(|a| a.port())
@@ -466,21 +473,34 @@ fn spawn_datalayer(
     let handoff = std::env::temp_dir().join(format!("pyielink-session-{}.env", crate::token::generate()));
     std::fs::write(&handoff, format!("{}\n{}\n{}\n", session_key, user, role))
         .map_err(|e| format!("cannot write session handoff: {}", e))?;
-    let attempt = Command::new("node")
+    eprintln!("  [dbg] spawning node: script={} port={} handoff={}", script.display(), port, handoff.display());
+    match Command::new("node")
         .arg(&script)
         .arg("--port")
         .arg(port.to_string())
         .env("PYIELINK_SESSION", &handoff)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    match attempt {
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
         Ok(mut child) => {
-            if let Some(out) = child.stdout.take() {
-                std::thread::spawn(move || drain_to_console(out, "dl"));
-            }
-            if let Some(err) = child.stderr.take() {
-                std::thread::spawn(move || drain_to_console(err, "dl!"));
+            let mon_port = port;
+            std::thread::spawn(move || {
+                for i in 0..14 {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let reachable =
+                        std::net::TcpStream::connect(format!("127.0.0.1:{}", mon_port)).is_ok();
+                    eprintln!("[dbg] t={}ms port {} reachable={}", i * 500, mon_port, reachable);
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    eprintln!("[dbg] node already exited within 600ms: {:?}", status)
+                }
+                Ok(None) => eprintln!("[dbg] node still running after 600ms"),
+                Err(e) => eprintln!("[dbg] node try_wait error: {}", e),
             }
             Ok((child, port))
         }

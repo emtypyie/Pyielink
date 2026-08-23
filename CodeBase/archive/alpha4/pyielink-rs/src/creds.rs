@@ -269,6 +269,45 @@ pub fn cmd_enable() -> Result<(), String> {
     Ok(())
 }
 
+pub fn cmd_enable_with_flags(allow_all: bool, whitelist: Vec<String>) -> Result<(), String> {
+    let mut state = load_state();
+    if state.users.is_empty() {
+        return Err("no user accounts exist yet. run '/adduser -m <name>' first.".into());
+    }
+    state.enabled = true;
+    state.allow_all_ips = allow_all;
+    state.ip_whitelist = whitelist;
+    save_state(&state).map_err(|e| format!("could not save state: {}", e))?;
+    Ok(())
+}
+
+/// Add an IP to the whitelist and persist state.
+/// Whitelist entries are IP address strings (e.g., "192.168.1.100").
+pub fn add_to_whitelist(ip: String) -> Result<(), String> {
+    let mut state = load_state();
+    if state.users.is_empty() {
+        return Err("no user accounts exist. run '/adduser -m <name>' first.".into());
+    }
+    // Add to whitelist if not already present
+    if !state.ip_whitelist.contains(&ip) {
+        state.ip_whitelist.push(ip);
+        save_state(&state).map_err(|e| format!("could not save state: {}", e))?;
+    }
+    Ok(())
+}
+
+/// Remove an IP from the whitelist and persist state.
+pub fn remove_from_whitelist(ip: &str) -> Result<(), String> {
+    let mut state = load_state();
+    if state.users.is_empty() {
+        return Err("no user accounts exist. run '/adduser -m <name>' first.".into());
+    }
+    // Remove from whitelist
+    state.ip_whitelist.retain(|x| x != ip);
+    save_state(&state).map_err(|e| format!("could not save state: {}", e))?;
+    Ok(())
+}
+
 /* ---- interactive prompts ---- */
 
 #[cfg(windows)]
@@ -495,6 +534,28 @@ pub fn parse_state(body: &str) -> Option<HostState> {
                 if probe.clone_key_is("enabled") {
                     sc.need_key("enabled")?;
                     state.enabled = sc.boolean()?;
+                } else if probe.clone_key_is("allow_all_ips") {
+                    sc.need_key("allow_all_ips")?;
+                    state.allow_all_ips = sc.boolean()?;
+                } else if probe.clone_key_is("ip_whitelist") {
+                    sc.need_key("ip_whitelist")?;
+                    sc.need(b'[')?;
+                    loop {
+                        match sc.peek()? {
+                            b']' => {
+                                sc.eat(b']');
+                                break;
+                            }
+                            b',' => {
+                                sc.eat(b',');
+                            }
+                            b'"' => {
+                                let ip = sc.str_lit()?;
+                                state.ip_whitelist.push(ip);
+                            }
+                            _ => return None,
+                        }
+                    }
                 } else if probe.clone_key_is("users") {
                     sc.need_key("users")?;
                     sc.need(b'{')?;

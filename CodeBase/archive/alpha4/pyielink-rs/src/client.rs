@@ -453,7 +453,25 @@ pub fn run_connect(target: &str, repl_mode: bool) -> Result<(), String> {
     if repl_mode {
         run_session(target, RunMode::Shell)
     } else {
-        run_gui_session(target, None, None)
+        // GUI mode: feed the H.264/MPEG-TS stream from the data link into a
+        // decoder + window. The window is created lazily on the first video
+        // frame so it only appears AFTER a connection is established and
+        // video is actually flowing.
+        let mut win: Option<crate::video_window::VideoWindow> = None;
+        let title = "Pyielink — Remote Screen".to_string();
+        let video_cb: Box<dyn FnMut(&[u8]) + Send> = Box::new(move |chunk: &[u8]| {
+            if win.is_none() {
+                win = Some(crate::video_window::VideoWindow::new(&title));
+            }
+            if let Some(w) = win.as_mut() {
+                w.push_ts(chunk);
+                w.pump();
+            }
+        });
+        let audio_cb: Box<dyn FnMut(&[u8]) + Send> = Box::new(|_chunk: &[u8]| {
+            // Audio playback is handled separately; ignore raw Opus here.
+        });
+        run_gui_session(target, Some(video_cb), Some(audio_cb))
     }
 }
 
@@ -882,7 +900,9 @@ fn data_link_connect(
     width: u32,
     height: u32,
 ) -> DlLinkResult {
-    let addr = format!("{}:{}", ip, port);
+    let dl_host = std::env::var("PYIELINK_DL_HOST").unwrap_or_else(|_| ip.to_string());
+    let dl_port = std::env::var("PYIELINK_DL_PORT").unwrap_or_else(|_| port.to_string());
+    let addr = format!("{}:{}", dl_host, dl_port);
     let tcp = match TcpStream::connect(&addr) {
         Ok(s) => s,
         Err(e) => {

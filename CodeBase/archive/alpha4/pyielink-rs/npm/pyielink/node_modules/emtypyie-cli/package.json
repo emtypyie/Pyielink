@@ -1,0 +1,40 @@
+{
+  "name": "emtypyie-cli",
+  "version": "3.0.2",
+  "releaseDate": "2026-07-29",
+  "description": "Emtypyie.cli — Run emtypyie projects from your terminal with ease",
+  "main": "cli.js",
+  "bin": {
+    "emtypyie": "cli.js"
+  },
+  "scripts": {
+    "start": "node cli.js",
+    "build": "pkg cli.js --targets node16-win-x64 --output dist/emtypyie.exe",
+    "prepublishOnly": "node -e \"console.log('Publishing emtypyie-cli v' + require('./package.json').version)\""
+  },
+  "pkg": {
+    "assets": [
+      "commands/**/*"
+    ]
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/emtypyie/emtypyie-cli.git"
+  },
+  "keywords": [
+    "emtypyie",
+    "cli",
+    "project-manager",
+    "terminal"
+  ],
+  "license": "SEE LICENSE IN LICENSE",
+  "dependencies": {
+    "chalk": "^4.1.2"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  }
+}
