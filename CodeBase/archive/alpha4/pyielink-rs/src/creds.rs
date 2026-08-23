@@ -30,6 +30,8 @@ impl UserRecord {
 pub struct HostState {
     pub enabled: bool,
     pub users: BTreeMap<String, UserRecord>,
+    pub ip_whitelist: Vec<String>,
+    pub allow_all_ips: bool,
 }
 
 pub fn state_path() -> std::path::PathBuf {
@@ -376,7 +378,16 @@ pub fn read_line_prompt(prompt: &str) -> String {
 pub fn render_state(state: &HostState) -> String {
     let mut out = String::from("{\n  \"enabled\": ");
     out.push_str(if state.enabled { "true" } else { "false" });
-    out.push_str(",\n  \"users\": {\n");
+    out.push_str(",\n  \"allow_all_ips\": ");
+    out.push_str(if state.allow_all_ips { "true" } else { "false" });
+    out.push_str(",\n  \"ip_whitelist\": [");
+    for (i, ip) in state.ip_whitelist.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("\"{}\"", ip));
+    }
+    out.push_str("],\n  \"users\": {\n");
     let mut first = true;
     for (name, u) in &state.users {
         if !first {
