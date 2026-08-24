@@ -117,10 +117,11 @@ wss.on("connection", (ws) => {
       },
       onRtt: (ms) => console.log(`[pyielink-dl] rtt ${ms} ms`),
     });
-    const files = new FileService(mux, session, (m) => console.log(m));
-    const input = new InputService(mux, session, (m) => console.log(m));
-    const video = new VideoService(mux, session, (m) => console.log(m));
-    const audio = new AudioService(mux, session, (m) => console.log(m));
+    const svcLog = (m) => { flog(m); console.log(m); };
+    const files = new FileService(mux, session, svcLog);
+    const input = new InputService(mux, session, svcLog);
+    const video = new VideoService(mux, session, svcLog);
+    const audio = new AudioService(mux, session, svcLog);
     hb.start();
     ws.on("close", (code) => {
       if (code === 1000 || code === 1005) {

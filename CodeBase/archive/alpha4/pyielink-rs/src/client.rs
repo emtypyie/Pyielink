@@ -461,15 +461,17 @@ pub fn run_connect(target: &str, repl_mode: bool) -> Result<(), String> {
         run_session(target, RunMode::Shell)
     } else {
         // GUI mode: feed the H.264/MPEG-TS stream from the data link into a
-        // decoder + window. The window is created lazily on the first video
-        // frame so it only appears AFTER a connection is established and
-        // video is actually flowing.
-        let mut win: Option<crate::video_window::VideoWindow> = None;
+        // decoder + window. The window is created up-front and shows a
+        // "Connecting…" placeholder until real frames arrive.
         let title = "Pyielink — Remote Screen".to_string();
-        let video_cb: Box<dyn FnMut(&[u8]) + Send> = Box::new(move |chunk: &[u8]| {
-            if win.is_none() {
-                win = Some(crate::video_window::VideoWindow::new(&title));
+        let mut win: Option<crate::video_window::VideoWindow> = match crate::video_window::VideoWindow::new(&title) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                println!("  [warn] {} — continuing without video window", e);
+                None
             }
+        };
+        let video_cb: Box<dyn FnMut(&[u8]) + Send> = Box::new(move |chunk: &[u8]| {
             if let Some(w) = win.as_mut() {
                 w.push_ts(chunk);
                 w.pump();
@@ -508,11 +510,20 @@ pub fn run_gui_session(
         .map_err(|e| format!("handshake send failed: {}", e))?;
 
     // Use shared authentication function
-    let (data_port, session_key, session_state, addr, _bootstrap) = authenticate(target)?;
+    let (data_port, session_key, session_state, addr, bootstrap) = authenticate(target)?;
 
     let session_state_arc = Arc::new(std::sync::Mutex::new(session_state));
     let dl_state = Arc::new(AtomicU8::new(DL_CONNECTING));
     let dl_stop = Arc::new(AtomicU8::new(0));
+
+    // Keep the bootstrap session (and with it the data layer child) alive for
+    // the whole GUI session; without this the host tears everything down the
+    // moment authenticate() returns.
+    {
+        let ka_stream = bootstrap;
+        let ka_stop = Arc::clone(&dl_stop);
+        std::thread::spawn(move || bootstrap_keepalive(ka_stream, ka_stop));
+    }
     let (xfer_tx, xfer_rx) = mpsc::channel::<DlCommand>();
     let (video_ctrl_tx, video_ctrl_rx) = mpsc::channel::<DlCommand>();
     
@@ -567,11 +578,13 @@ pub fn run_gui_session(
         
         let action = match result {
             DlLinkResult::Stopped => {
+                dl_stop.store(1, Ordering::Relaxed);
                 return Ok(());
             }
             DlLinkResult::Reconnect => {
                 reconnect_attempts += 1;
                 if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
+                    dl_stop.store(1, Ordering::Relaxed);
                     return Err(format!("max reconnection attempts ({}) reached", MAX_RECONNECT_ATTEMPTS));
                 }
                 println!("  [reconnect] attempt {}/{} in {:?}...", reconnect_attempts, MAX_RECONNECT_ATTEMPTS, RECONNECT_DELAY);
@@ -581,6 +594,7 @@ pub fn run_gui_session(
                 ReconnectAction::Reconnect
             }
             DlLinkResult::Error(e) => {
+                dl_stop.store(1, Ordering::Relaxed);
                 return Err(e);
             }
         };
@@ -593,6 +607,38 @@ pub fn run_gui_session(
 
 enum ReconnectAction {
     Reconnect,
+}
+
+/// Serves the bootstrap channel while a GUI session runs: answers the host's
+/// PINGs with PONGs so the host keeps this session's data layer alive, and
+/// hangs up cleanly once the data link ends (`stop` set) or the socket dies.
+fn bootstrap_keepalive(
+    mut stream: std::net::TcpStream,
+    stop: Arc<AtomicU8>,
+) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    loop {
+        if stop.load(Ordering::Relaxed) == 1 {
+            break;
+        }
+        match proto::read_frame(&mut stream) {
+            Ok((PING, payload)) => {
+                if proto::write_frame(&mut stream, PONG, &payload).is_err() {
+                    return;
+                }
+            }
+            Ok((BYE, _)) => return,
+            Ok(_) => {}
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => return,
+        }
+    }
+    let _ = proto::write_frame(&mut stream, BYE, b"gui session ended");
 }
 
 /// one-shot download: auth, transfer, BYE — fully scriptable
@@ -992,8 +1038,6 @@ fn data_link_connect(
 
     // control-channel heartbeat: answer server PINGs, send our own, log RTT
     let mut last_seen = Instant::now();
-    let mut next_ping = Instant::now() + DL_PING_EVERY;
-    let mut awaiting_pong_at: Option<(u128, Instant)> = None;
     // file-transfer state (Phase 3.1)
     let mut transfers: HashMap<u32, Active> = HashMap::new();
     let mut next_id: u32 = 1;
@@ -1056,12 +1100,13 @@ fn data_link_connect(
     
     // control-channel heartbeat: answer server PINGs, send our own, log RTT
     let mut last_seen = Instant::now();
-    let mut next_ping = Instant::now() + DL_PING_EVERY;
-    let mut awaiting_pong_at: Option<(u128, Instant)> = None;
     // file-transfer state (Phase 3.1)
     let mut transfers: HashMap<u32, Active> = HashMap::new();
     let mut next_id: u32 = 1;
-    
+    eprintln!("[vdbg] main loop entered");
+    let up_since = Instant::now();
+    static NO_VIDEO_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
     loop {
         if stop.load(Ordering::Relaxed) == 1 {
             // Save transfer state before shutdown
@@ -1112,26 +1157,31 @@ fn data_link_connect(
         pump_puts(&mut ws, &mut transfers);
         match ws.read() {
             Ok(Message::Binary(buf)) => match dl_parse(&buf) {
-                Some((0x01, payload)) if payload.first() == Some(&b'P') => {
+                Some((0x01, payload)) => {
+                    // Server drives the heartbeat ("PING"): answer "PONG".
+                    // Anything else just refreshes liveness.
                     last_seen = Instant::now();
-                    let _ = ws.send(Message::Binary(dl_frame(0x01, payload))); // PONG echoes nonce
-                }
-                Some((0x01, payload)) if payload.first() == Some(&b'Q') => {
-                    last_seen = Instant::now();
-                    if let Some((sent_ms, _)) =
-                        awaiting_pong_at.take_if(|(ms, _)| payload.get(1..) == Some(ms.to_string().as_bytes()))
-                    {
-                        let rtt = now_ms().saturating_sub(sent_ms);
-                        println!("  [dl-hb] rtt {}ms", rtt);
-                        rtt_estimate = rtt;
+                    if payload == b"PING" || payload == b"P" {
+                        let _ = ws.send(Message::Binary(dl_frame(0x01, b"PONG")));
                     }
                 }
                 Some((DL_CH_META, payload)) => handle_meta_json(payload, &mut ws, &mut transfers, &status),
                 Some((DL_CH_CHUNK, payload)) => handle_chunk(payload, &mut ws, &mut transfers, &status),
                 Some((DL_CH_VIDEO, payload)) => {
+                    if total_video_bytes == 0 {
+                        eprintln!("[vdbg] first video chunk ({} bytes)", payload.len());
+                    }
                     total_video_bytes += payload.len() as u64;
+                    if total_video_bytes / (256 * 1024) > (total_video_bytes - payload.len() as u64) / (256 * 1024) {
+                        eprintln!("[vdbg] video bytes so far: {} KiB", total_video_bytes / 1024);
+                    }
                     if let Some(cb) = video_callback.as_mut() {
                         cb(payload);
+                    } else {
+                        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            eprintln!("[vdbg] NO video callback wired!");
+                        }
                     }
                 }
                 Some((DL_CH_AUDIO, payload)) => {
@@ -1139,7 +1189,12 @@ fn data_link_connect(
                         cb(payload);
                     }
                 }
-                _ => {} // unknown channel: drop silently (mirrors mux policy)
+                _ => {
+                    static UNK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !UNK.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("[vdbg] dropped frame: len={} ch0={:?}", buf.len(), buf.first());
+                    }
+                } // unknown channel: drop silently (mirrors mux policy)
             },
             Ok(Message::Close(_)) | Ok(Message::Frame(_)) => {
                 println!("  [dl-link] data layer closed the channel");
@@ -1151,24 +1206,24 @@ fn data_link_connect(
             Err(tungstenite::Error::Io(ref e))
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
+                {
+                    if total_video_bytes == 0
+                        && up_since.elapsed() >= Duration::from_secs(8)
+                        && !NO_VIDEO_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        eprintln!(
+                            "[video] connected but no video frames arriving — host encoder or stream path is failing"
+                        );
+                    }
                 if last_seen.elapsed() >= DL_STALE {
                     eprintln!("  [dl-link] data layer stopped responding — tearing down");
                     state.store(DL_DEAD, Ordering::Relaxed);
                     save_session_state(session_state, &transfers);
                     return DlLinkResult::Reconnect;
                 }
-                if next_ping.elapsed() >= Duration::from_secs(0) {
-                    let ms = now_ms();
-                    if ws.send(Message::Binary(dl_frame(0x01, format!("P{}", ms).as_bytes()))).is_err() {
-                        eprintln!("  [dl-link] ping send failed");
-                        state.store(DL_DEAD, Ordering::Relaxed);
-                        save_session_state(session_state, &transfers);
-                        return DlLinkResult::Reconnect;
-                    }
-                    awaiting_pong_at = Some((ms, Instant::now()));
-                    next_ping += DL_PING_EVERY;
-                }
+                // The data layer drives heartbeats; the client only answers
+                // PINGs (above). No client-initiated pings: they used to be
+                // echoed back by the server and created an infinite loop.
             }
             Err(e) => {
                 // a one-shot transfer that already finished tears the socket
@@ -1831,7 +1886,6 @@ fn post_auth_loop(
     input_running: &Arc<AtomicBool>,
     input_handle: &mut Option<std::thread::JoinHandle<()>>,
 ) -> Result<(), String> {
-    eprintln!("[dbg] post_auth_loop start interactive={}", interactive);
     let mut stdin_rx = if interactive { Some(spawn_stdin_reader()) } else { None };
     let mut stdin_done = false;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
@@ -1922,7 +1976,6 @@ fn post_auth_loop(
         }
         match proto::read_frame(stream) {
             Ok((PING, payload)) => {
-                eprintln!("[dbg] post_auth_loop got PING");
                 last_ping_seen = Instant::now();
                 if let Ok(sent) = String::from_utf8_lossy(&payload).trim().parse::<u128>() {
                     println!("  [hb] rtt {}ms", now_ms().saturating_sub(sent));
@@ -1973,7 +2026,6 @@ fn post_auth_loop(
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 if dl_state.load(Ordering::Relaxed) == DL_DEAD {
-                    eprintln!("[dbg] post_auth_loop exit: dl dead");
                     let _ = proto::write_frame(stream, BYE, b"data-link lost");
                     return Err("data link died — session ended".into());
                 }
@@ -1983,13 +2035,11 @@ fn post_auth_loop(
                     return Ok(());
                 }
                 if last_ping_seen.elapsed() >= HB_STALE {
-                    eprintln!("[dbg] post_auth_loop exit: hb stale");
                     let _ = proto::write_frame(stream, BYE, b"stall");
                     return Err("host stopped responding to heartbeats".into());
                 }
             }
             Err(_) => {
-                eprintln!("[dbg] post_auth_loop exit: read error");
                 return Err("connection lost".into())
             }
         }

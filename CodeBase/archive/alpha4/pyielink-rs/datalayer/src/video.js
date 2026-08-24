@@ -59,11 +59,12 @@ export class VideoService {
 
     _handleBitrateRequest(msg) {
         const requestedKbps = Math.max(this.minBitrate, Math.min(this.maxBitrate, msg.kbps));
-        if (requestedKbps !== this.currentBitrate) {
-            this.log(`[video] bitrate change requested: ${this.currentBitrate} -> ${requestedKbps} kbps`);
-            this.currentBitrate = requestedKbps;
-            this._restartWithNewBitrate();
-        }
+        const delta = Math.abs(requestedKbps - this.currentBitrate) / this.currentBitrate;
+        if (delta < 0.25 || Date.now() - (this._lastRestart || 0) < 15000) return;
+        this._lastRestart = Date.now();
+        this.log(`[video] bitrate change requested: ${this.currentBitrate} -> ${requestedKbps} kbps`);
+        this.currentBitrate = requestedKbps;
+        this._restartWithNewBitrate();
     }
 
     _restartWithNewBitrate() {
@@ -196,13 +197,26 @@ export class VideoService {
 
     _onVideoData(chunk) {
         if (this.paused) return;
-        
+        this._totalSent = (this._totalSent || 0) + chunk.length;
+        if (!this._dataSeen) {
+            this._dataSeen = true;
+            this.log(`[video] first stdout data (${chunk.length} bytes)`);
+        }
+        if (this._totalSent - (this._lastLogged || 0) >= 1024 * 1024) {
+            this._lastLogged = this._totalSent;
+            this.log(`[video] encoder produced ${(this._totalSent / 1048576).toFixed(1)} MiB`);
+        }
+
         this.buffer = Buffer.concat([this.buffer, chunk]);
 
         while (this.buffer.length >= CHUNK_SIZE) {
             const frame = this.buffer.subarray(0, CHUNK_SIZE);
             this.buffer = this.buffer.subarray(CHUNK_SIZE);
-            this.mux.send(CHANNELS.VIDEO, frame);
+            const ok = this.mux.send(CHANNELS.VIDEO, frame);
+            if (!ok && !this._sendDropped) {
+                this._sendDropped = true;
+                this.log(`[video] mux.send DROPPED (readyState=${this.mux.ws?.readyState}, buffered=${this.mux.ws?.bufferedAmount})`);
+            }
         }
     }
 }

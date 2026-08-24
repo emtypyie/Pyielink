@@ -330,7 +330,6 @@ fn session_loop(
         // heartbeat when due
         if last_ping_sent.elapsed() >= PING_INTERVAL {
             if proto::write_frame(stream, PING, now_ms().to_string().as_bytes()).is_err() {
-                eprintln!("[dbg] session_loop break: ping write failed");
                 break;
             }
             last_ping_sent = Instant::now();
@@ -339,7 +338,6 @@ fn session_loop(
             Ok((PONG, _)) => {
                 last_pong = Instant::now();
                 if !sessions::touch(session_key) {
-                    eprintln!("[dbg] session_loop break: touch failed");
                     break;
                 }
             }
@@ -350,7 +348,6 @@ fn session_loop(
             }
             Ok((BYE, _)) => {
                 println!("  [bye] {} closed the session cleanly", user);
-                eprintln!("[dbg] session_loop break: BYE");
                 break;
             }
             Ok((EXEC_REQ, payload)) => {
@@ -393,27 +390,18 @@ fn session_loop(
             {
                 if last_pong.elapsed() >= PONG_GRACE {
                     println!("  [lost] {} missed heartbeats — closing session", user);
-                    eprintln!("[dbg] session_loop break: pong grace");
                     break;
                 }
             }
             Err(_) => {
-                eprintln!("[dbg] session_loop break: read error");
                 break;
             } // connection dead
         }
     }
     sessions::close(session_key);
     if let Some(child) = datalayer {
-        match child.try_wait() {
-            Ok(Some(s)) => eprintln!("[dbg] data layer already exited before kill: {:?}", s),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                eprintln!("[dbg] data layer killed by host");
-            }
-            Err(e) => eprintln!("[dbg] data layer try_wait err: {}", e),
-        }
+        let _ = child.kill();
+        let _ = child.wait();
         println!("  [dl] data layer for '{}' stopped", user);
     }
 }
@@ -487,7 +475,6 @@ fn spawn_datalayer(
     let handoff = std::env::temp_dir().join(format!("pyielink-session-{}.env", crate::token::generate()));
     std::fs::write(&handoff, format!("{}\n{}\n{}\n", session_key, user, role))
         .map_err(|e| format!("cannot write session handoff: {}", e))?;
-    eprintln!("  [dbg] spawning node: script={} port={} handoff={}", script.display(), port, handoff.display());
     match Command::new("node")
         .arg(&script)
         .arg("--port")
@@ -499,23 +486,8 @@ fn spawn_datalayer(
         .spawn()
     {
         Ok(mut child) => {
-            let mon_port = port;
-            std::thread::spawn(move || {
-                for i in 0..14 {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    let reachable =
-                        std::net::TcpStream::connect(format!("127.0.0.1:{}", mon_port)).is_ok();
-                    eprintln!("[dbg] t={}ms port {} reachable={}", i * 500, mon_port, reachable);
-                }
-            });
+            // give the data layer a moment to bind before clients arrive
             std::thread::sleep(std::time::Duration::from_millis(600));
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    eprintln!("[dbg] node already exited within 600ms: {:?}", status)
-                }
-                Ok(None) => eprintln!("[dbg] node still running after 600ms"),
-                Err(e) => eprintln!("[dbg] node try_wait error: {}", e),
-            }
             Ok((child, port))
         }
         Err(e) => {

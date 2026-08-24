@@ -196,13 +196,21 @@ export class VideoService {
 
     _onVideoData(chunk) {
         if (this.paused) return;
-        
+        if (!this._dataSeen) {
+            this._dataSeen = true;
+            this.log(`[video] first stdout data (${chunk.length} bytes)`);
+        }
+
         this.buffer = Buffer.concat([this.buffer, chunk]);
 
         while (this.buffer.length >= CHUNK_SIZE) {
             const frame = this.buffer.subarray(0, CHUNK_SIZE);
             this.buffer = this.buffer.subarray(CHUNK_SIZE);
-            this.mux.send(CHANNELS.VIDEO, frame);
+            const ok = this.mux.send(CHANNELS.VIDEO, frame);
+            if (!ok && !this._sendDropped) {
+                this._sendDropped = true;
+                this.log(`[video] mux.send DROPPED (readyState=${this.mux.ws?.readyState}, buffered=${this.mux.ws?.bufferedAmount})`);
+            }
         }
     }
 }
