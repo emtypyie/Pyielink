@@ -10,6 +10,9 @@
 
 import { spawn } from "child_process";
 import process from "node:process";
+import dgram from "node:dgram";
+import { existsSync, openSync, writeSync, closeSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
@@ -39,6 +42,7 @@ const RECONNECT_DELAY_MS = 2000;
 // ---- mux framing (mirrors datalayer/src/mux.js) ----------------------------
 const HEADER = 5;
 const CH_CONTROL = 0x01;
+const CH_INPUT = 0x02;
 const CH_VIDEO = 0x03;
 
 class MuxReader {
@@ -80,25 +84,33 @@ let viewer = null;
 
 function ensureViewer() {
   if (viewer) return;
+  // Branding ships next to this script (datalayer/src/assets/).
+  // PNG renders most reliably through System.Drawing; ICO is the fallback.
+  const a = p => fileURLToPath(new URL(`./assets/${p}`, import.meta.url));
+  const iconImg = existsSync(a("PyieLink1.png")) ? a("PyieLink1.png") : a("PyieLink.ico");
+  let proc;
+  let kind;
+  // TEMP DIAGNOSTIC: capture the player's own stderr verbosely so we can see
+  // exactly why it dies inside a session (isolation repro says args are fine).
+  const ffLog = openSync(process.env.TEMP + "\\pyielink-ffplay.log", "a");
+  try { writeSync(ffLog, `\n==== viewer spawn ${new Date().toISOString()} ====\n`); } catch {}
   const common = [
     // NOTE: all input options (and -window_title) MUST come before -i,
-    // otherwise ffplay parses the title string as the input filename.
+    // otherwise ffplay parses them as the input filename.
     "-fflags", "+nobuffer",
     "-probesize", "32",
     "-analyzeduration", "0",
-    "-window_title", "Pyielink — Remote Screen",
-    "-loglevel", "error",
+    "-window_title", "Pyielink - Remote Screen",
+    "-loglevel", "verbose",
     "-nostats",
     "-i", "pipe:0",
   ];
-  let proc;
-  let kind;
   try {
-    proc = spawn("ffplay", common, { stdio: ["pipe", "ignore", "inherit"] });
+    proc = spawn("ffplay", common, { stdio: ["pipe", "ignore", ffLog] });
     kind = "ffplay";
   } catch {
-    proc = spawn("ffmpeg", [...common, "-f", "sdl2", "Pyielink — Remote Screen"], {
-      stdio: ["pipe", "ignore", "inherit"],
+    proc = spawn("ffmpeg", [...common, "-f", "sdl2", "Pyielink - Remote Screen"], {
+      stdio: ["pipe", "ignore", ffLog],
     });
     kind = "ffmpeg-sdl2";
   }
@@ -108,10 +120,85 @@ function ensureViewer() {
   proc.on("error", (e) => log(`viewer error (${kind}): ${e.message}`));
   proc.on("close", (code) => {
     log(`viewer (${kind}) exited (code ${code})`);
+    try {
+      writeSync(ffLog, `==== viewer exited code=${code} ${new Date().toISOString()} ====\n`);
+      closeSync(ffLog);
+    } catch {}
     if (viewer?.proc === proc) viewer = null;
   });
   viewer = { proc, kind };
   log(`viewer started: ${kind}`);
+  applyWindowIcon(iconImg);
+}
+
+// ffplay has no -window_icon option, so set the titlebar icon afterwards via
+// a small PowerShell helper: it finds the player window through the process
+// table, applies WM_SETICON repeatedly (SDL re-stomps early one-shots), then
+// parks for the window's lifetime (HICONS die with their creator process).
+function applyWindowIcon(pngPath) {
+  const ps1 = fileURLToPath(new URL("./assets/set_icon.ps1", import.meta.url));
+  if (!existsSync(ps1) || !existsSync(pngPath)) {
+    log(`icon skip: ps1=${existsSync(ps1)} img=${existsSync(pngPath)}`);
+    return;
+  }
+  const trace = process.env.TEMP + "\\pyielink-seticon.log";
+  try {
+    spawn("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass",
+      "-File", ps1, "-ProcName", "ffplay", "-Image", pngPath, "-Trace", trace],
+      { stdio: "ignore" });
+  } catch (e) {
+    log(`icon spawn failed: ${e.message}`);
+  }
+}
+
+// ---- input relay -----------------------------------------------------------
+// input_hook.ps1 (parked, detached) watches the player window and fires
+// normalized mouse/key events at a localhost UDP socket; we forward them
+// onto the INPUT channel. One helper per viewer window: kill any previous
+// instance before spawning a new one so reconnects never double-hook.
+let inputUdp = null;
+let inputHelper = null;
+
+function stopInputRelay() {
+  if (inputHelper) {
+    try { process.kill(inputHelper.pid); } catch {}
+    try { spawn("taskkill", ["/PID", String(inputHelper.pid), "/T", "/F"], { stdio: "ignore" }).unref(); } catch {}
+    inputHelper = null;
+  }
+  if (inputUdp) {
+    try { inputUdp.close(); } catch {}
+    inputUdp = null;
+  }
+}
+
+function startInputRelay(ws) {
+  stopInputRelay();
+  const ps1 = fileURLToPath(new URL("./assets/input_hook.ps1", import.meta.url));
+  if (!existsSync(ps1)) {
+    log("input helper missing, remote control disabled");
+    return;
+  }
+  const sock = dgram.createSocket("udp4");
+  sock.on("message", (buf) => {
+    const cur = activeWs;
+    if (cur && cur.readyState === WebSocket.OPEN) {
+      try { cur.send(frame(CH_INPUT, buf)); } catch {}
+    }
+  });
+  sock.on("error", (e) => log(`input udp error: ${e.message}`));
+  sock.bind(0, "127.0.0.1", () => {
+    const port = sock.address().port;
+    const helper = spawn(
+      "powershell",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
+       "-ProcName", "ffplay", "-UdpPort", String(port)],
+      { stdio: "ignore", detached: true }
+    );
+    helper.unref();
+    inputHelper = helper;
+    inputUdp = sock;
+    log(`input relay up (udp:${port}, pid:${helper.pid})`);
+  });
 }
 
 // ---- session ---------------------------------------------------------------
@@ -174,6 +261,8 @@ function connect() {
             JSON.stringify({ t: "video_start", monitor_index: 0, offset_x: 0, offset_y: 0, width: 0, height: 0 })
           )
         );
+        ws.send(frame(CH_INPUT, JSON.stringify({ t: "input_start" })));
+        startInputRelay(ws);
       } else {
         log(`unexpected ack: ${ack.trim()}`);
         ws.close();
@@ -184,7 +273,11 @@ function connect() {
   });
 
   ws.on("close", (code) => {
-    if (authed) log(`data layer closed (code ${code})`);
+    if (authed) {
+      log(`data layer closed (code ${code})`);
+      try { ws.send(frame(CH_INPUT, JSON.stringify({ t: "input_stop" }))); } catch {}
+      stopInputRelay();
+    }
     scheduleReconnect(`closed ${code}`);
   });
 
@@ -194,7 +287,11 @@ function connect() {
   });
 }
 
-process.on("SIGINT", () => process.exit(0));
+process.on("SIGINT", () => {
+  stopInputRelay();
+  process.exit(0);
+});
+process.on("exit", () => stopInputRelay());
 process.on("uncaughtException", (e) => log(`UNCAUGHT: ${e.stack || e}`));
 
 connect();
