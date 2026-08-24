@@ -79,7 +79,7 @@ function downloadBinary(url, dest, callback) {
   const http = require("https");
   const file = fs.createWriteStream(dest);
 
-  http.get(url, (response) => {
+  http.get(url, { headers: { "User-Agent": "pyielink-cli" } }, (response) => {
     if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
       file.close();
       fs.unlinkSync(dest);
@@ -188,7 +188,7 @@ async function maybeDownloadBinary() {
   return new Promise((resolve, reject) => {
     // Fetch latest release from GitHub
     const http = require("https");
-    const req = http.get(apiUrl, (response) => {
+    const req = http.get(apiUrl, { headers: { "User-Agent": "pyielink-cli", "Accept": "application/vnd.github+json" } }, (response) => {
       let data = "";
 
       response.on("data", (chunk) => {
@@ -196,6 +196,13 @@ async function maybeDownloadBinary() {
       });
 
       response.on("end", () => {
+        // GitHub returns non-JSON (HTML) on 403/404 if headers are wrong
+        if (response.statusCode !== 200) {
+          process.stdout.write(`  [error] GitHub API returned HTTP ${response.statusCode}\n`);
+          try { process.stdout.write("  " + data.slice(0, 300) + "\n"); } catch {}
+          reject(new Error(`GitHub API HTTP ${response.statusCode}`));
+          return;
+        }
         try {
           const release = JSON.parse(data);
           // Find the asset for our platform
@@ -343,7 +350,12 @@ After installation, run:
   process.stdout.write("Pyielink " + pkg.version + "\n\n");
 
   // Step 1: Ensure binary is available (use bundled or download if needed)
-  await maybeDownloadBinary();
+  try {
+    await maybeDownloadBinary();
+  } catch (e) {
+    // maybeDownloadBinary already printed a user-facing error
+    process.exit(1);
+  }
 
   // Step 2: Run the Rust binary with our configured env
   runPyielink(args);

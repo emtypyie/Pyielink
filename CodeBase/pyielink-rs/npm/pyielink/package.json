@@ -1,38 +1,38 @@
-{
-  "name": "pyielink",
-  "version": "0.6.10",
-  "description": "Pyielink remote access framework â€” connect to host via screen sharing, file transfer, and terminal",
-  "main": "cli.js",
-  "bin": {
-    "pyielink": "cli.js"
-  },
-  "files": [
-    "cli.js",
-    "bin/",
-    "datalayer/",
-    "metadata.json",
-    "README.md"
-  ],
-  "scripts": {
-    "start": "node cli.js"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/EMTYPYIE/Pyielink"
-  },
-  "keywords": [
-    "pyielink",
-    "remote",
-    "access",
-    "framework",
-    "screen-sharing",
-    "file-transfer"
-  ],
-  "license": "MIT",
-  "engines": {
-    "node": ">=18"
-  },
-  "dependencies": {
-    "emtypyie-cli": "^3.0.2"
-  }
+﻿{
+    "name":  "pyielink",
+    "version":  "0.6.11",
+    "description":  "Pyielink remote access framework Ã¢â‚¬â€ connect to host via screen sharing, file transfer, and terminal",
+    "main":  "cli.js",
+    "bin":  {
+                "pyielink":  "cli.js"
+            },
+    "files":  [
+                  "cli.js",
+                  "bin/",
+                  "datalayer/",
+                  "metadata.json",
+                  "README.md"
+              ],
+    "scripts":  {
+                    "start":  "node cli.js"
+                },
+    "repository":  {
+                       "type":  "git",
+                       "url":  "https://github.com/EMTYPYIE/Pyielink"
+                   },
+    "keywords":  [
+                     "pyielink",
+                     "remote",
+                     "access",
+                     "framework",
+                     "screen-sharing",
+                     "file-transfer"
+                 ],
+    "license":  "MIT",
+    "engines":  {
+                    "node":  "\u003e=18"
+                },
+    "dependencies":  {
+                         "emtypyie-cli":  "^3.0.2"
+                     }
 }
