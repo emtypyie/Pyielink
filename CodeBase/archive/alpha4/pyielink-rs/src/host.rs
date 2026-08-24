@@ -485,7 +485,7 @@ fn spawn_datalayer(
         .stderr(Stdio::null())
         .spawn()
     {
-        Ok(mut child) => {
+        Ok(child) => {
             // give the data layer a moment to bind before clients arrive
             std::thread::sleep(std::time::Duration::from_millis(600));
             Ok((child, port))
@@ -494,16 +494,6 @@ fn spawn_datalayer(
             let _ = std::fs::remove_file(&handoff);
             Err(format!("cannot start data layer: {}", e))
         }
-    }
-}
-
-/// Forward Node child telemetry to the host console (and therefore into the
-/// host's redirected output in headless runs).
-fn drain_to_console<R: std::io::Read + Send + 'static>(pipe: R, tag: &'static str) {
-    use std::io::{BufRead, BufReader};
-    let reader = BufReader::new(pipe);
-    for line in reader.lines().map_while(Result::ok) {
-        println!("  [{}] {}", tag, line);
     }
 }
 

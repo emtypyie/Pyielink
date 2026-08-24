@@ -1,8 +1,6 @@
 use crate::creds;
 use crate::proto::{self, *};
-use crate::token;
 use sha2::{Digest, Sha256};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
@@ -23,7 +21,6 @@ const DL_DEAD: u8 = 2;
 const DL_RECONNECTING: u8 = 3;
 const DL_POLL: Duration = Duration::from_millis(200);
 const DL_STALE: Duration = Duration::from_secs(15);
-const DL_PING_EVERY: Duration = Duration::from_secs(5);
 /// file-transfer channels (mirrors datalayer/src/mux.js CHANNELS)
 const DL_CH_META: u8 = 0x04;
 const DL_CH_CHUNK: u8 = 0x05;
@@ -51,7 +48,6 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const BITRATE_REQUEST_INTERVAL: Duration = Duration::from_secs(5);
 const MIN_BITRATE_KBPS: u32 = 500;
 const MAX_BITRATE_KBPS: u32 = 20000;
-const TARGET_LATENCY_MS: u32 = 100;
 
 /// Global video control channel for sending pause/resume from GUI
 static VIDEO_CONTROL_TX: OnceLock<mpsc::Sender<DlCommand>> = OnceLock::new();
@@ -250,10 +246,8 @@ fn authenticate(
     proto::write_frame(&mut stream, HELLO, hello.as_bytes())
         .map_err(|e| format!("handshake send failed: {}", e))?;
 
-    let mut sent_token_proof = false;
-    let mut attempts = 0u32;
     let mut session_state: Option<SessionState> = None;
-    let mut keep_stream: Option<std::net::TcpStream> = None;
+    let keep_stream: Option<std::net::TcpStream>;
 
     loop {
         // Authenticate / re-authenticate
@@ -269,8 +263,7 @@ fn authenticate(
             proto::write_frame(&mut auth_stream, HELLO, hello.as_bytes())
                 .map_err(|e| format!("re-auth handshake failed: {}", e))?;
 
-            let mut sent_token_proof = false;
-            let mut attempts = 0u32;
+                    let mut attempts = 0u32;
             loop {
                 match expect_frame(&mut auth_stream)? {
                     (CHALLENGE, payload) => {
@@ -279,26 +272,13 @@ fn authenticate(
                             Some(x) => (x.0.to_string(), x.1.trim().to_string()),
                             None => return Err("malformed challenge from host".into()),
                         };
-                        let (mode, proof) = if !sent_token_proof {
-                            sent_token_proof = true;
-                            match token::load_client_token(&state.user, &state.ip) {
-                                Some(tok_hash) => {
-                                    println!("  [reconnect] found token for {}, using token auth", state.user);
-                                    ("t", creds::compute_proof(&tok_hash, &nonce))
-                                }
-                                None => {
-                                    println!("  [reconnect] no token found for {}, falling back to password", state.user);
-                                    ("p", password_proof(&salt, &nonce))
-                                }
-                            }
-                        } else {
-                            if attempts >= 3 {
-                                return Err("too many failed authentication attempts".into());
-                            }
-                            attempts += 1;
-                            ("p", password_proof(&salt, &nonce))
-                        };
-                        let framed = format!("{}:{}", mode, proof);
+                        // Password is required on every connection by
+                        // default; stored tokens are never used to skip it.
+                        if attempts >= 3 {
+                            return Err("too many failed authentication attempts".into());
+                        }
+                        attempts += 1;
+                        let framed = format!("p:{}", password_proof(&salt, &nonce));
                         proto::write_frame(&mut auth_stream, PROOF, framed.as_bytes())
                             .map_err(|e| format!("send failed: {}", e))?;
                     }
@@ -316,12 +296,9 @@ fn authenticate(
                         proto::write_frame(&mut auth_stream, LICENSE_ACCEPT, b"y")
                             .map_err(|e| e.to_string())?;
                     }
-                    (TOKEN_ISSUED, payload) => {
-                        let tok = String::from_utf8_lossy(&payload).trim().to_string();
-                        let token_hash = token::hash_token(&tok);
-                        let path = token::save_client_token(&state.user, &state.ip, &token_hash)
-                            .map_err(|e| format!("could not store token: {}", e))?;
-                        println!("  [ok] connection credential stored at {} (hash: {})", path.display(), &token_hash[..16]);
+                    (TOKEN_ISSUED, _payload) => {
+                        // Host still issues tokens; the client deliberately
+                        // does not store them — password is required each time.
                     }
                     (AUTH_OK, payload) => {
                         let ticket = String::from_utf8_lossy(&payload).into_owned();
@@ -355,8 +332,7 @@ fn authenticate(
             proto::write_frame(&mut stream, HELLO, hello.as_bytes())
                 .map_err(|e| format!("handshake send failed: {}", e))?;
 
-            let mut sent_token_proof = false;
-            let mut attempts = 0u32;
+                    let mut attempts = 0u32;
 
             loop {
                 match expect_frame(&mut stream)? {
@@ -366,34 +342,21 @@ fn authenticate(
                             Some(x) => (x.0.to_string(), x.1.trim().to_string()),
                             None => return Err("malformed challenge from host".into()),
                         };
-                        let (mode, proof) = if !sent_token_proof {
-                            sent_token_proof = true;
-                            match token::load_client_token(&user, &ip) {
-                                Some(tok_hash) => {
-                                    println!("  [auth] found token for {}, using token auth", user);
-                                    ("t", creds::compute_proof(&tok_hash, &nonce))
-                                }
-                                None => {
-                                    println!("  [auth] no token found for {}, using password", user);
-                                    if !creds::stdin_is_tty()
-                                        && std::env::var("PYIELINK_SHELL").as_deref() != Ok("1")
-                                    {
-                                        return Err(format!(
-                                            "no stored credential for {}@{} - run an interactive session once to store a token",
-                                            user, ip
-                                        ));
-                                    }
-                                    ("p", password_proof(&salt, &nonce))
-                                }
-                            }
-                        } else {
-                            if attempts >= 3 {
-                                return Err("too many failed authentication attempts".into());
-                            }
-                            attempts += 1;
-                            ("p", password_proof(&salt, &nonce))
-                        };
-                        let framed = format!("{}:{}", mode, proof);
+                        // Password is required on every connection by
+                        // default; stored tokens are never used to skip it.
+                        if !creds::stdin_is_tty()
+                            && std::env::var("PYIELINK_SHELL").as_deref() != Ok("1")
+                        {
+                            return Err(format!(
+                                "password required for {}@{} — run from an interactive terminal (or set PYIELINK_SHELL=1 for scripted use)",
+                                user, ip
+                            ));
+                        }
+                        if attempts >= 3 {
+                            return Err("too many failed authentication attempts".into());
+                        }
+                        attempts += 1;
+                        let framed = format!("p:{}", password_proof(&salt, &nonce));
                         proto::write_frame(&mut stream, PROOF, framed.as_bytes())
                             .map_err(|e| format!("send failed: {}", e))?;
                     }
@@ -411,12 +374,8 @@ fn authenticate(
                         proto::write_frame(&mut stream, LICENSE_ACCEPT, b"y")
                             .map_err(|e| e.to_string())?;
                     }
-                    (TOKEN_ISSUED, payload) => {
-                        let tok = String::from_utf8_lossy(&payload).trim().to_string();
-                        let token_hash = token::hash_token(&tok);
-                        let path = token::save_client_token(&user, &ip, &token_hash)
-                            .map_err(|e| format!("could not store token: {}", e))?;
-                        println!("  [ok] connection credential stored at {} (hash: {})", path.display(), &token_hash[..16]);
+                    (TOKEN_ISSUED, _payload) => {
+                        // Not stored: password is required each connection.
                     }
                     (AUTH_OK, payload) => {
                         let ticket = String::from_utf8_lossy(&payload).into_owned();
@@ -537,130 +496,7 @@ fn run_gui_session_node(target: &str) -> Result<(), String> {
     }
 }
 
-/// Start a session with a video frame callback for GUI rendering.
-/// The callback receives raw MPEG-TS packets from the VIDEO channel.
-/// The audio callback receives raw Opus packets from the AUDIO channel.
-pub fn run_gui_session(
-    target: &str,
-    mut video_cb: Option<Box<dyn FnMut(&[u8]) + Send>>,
-    mut audio_cb: Option<Box<dyn FnMut(&[u8]) + Send>>,
-) -> Result<(), String> {
-    let (user, ip) = parse_target(target)?;
-    let port: u16 = std::env::var("PYIELINK_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(BOOTSTRAP_PORT);
-    let addr = format!("{}:{}", ip, port);
-    println!("  [..] connecting to {} as '{}' ...", addr, user);
 
-    let mut stream = TcpStream::connect(&addr)
-        .map_err(|e| format!("cannot reach {} — is the host running /enable? ({})", addr, e))?;
-    stream.set_nodelay(true).map_err(|e| e.to_string())?;
-    stream.set_read_timeout(Some(CONNECT_TIMEOUT)).map_err(|e| e.to_string())?;
-
-    let hello = format!("{}\n{}\n", user, env!("CARGO_PKG_VERSION"));
-    proto::write_frame(&mut stream, HELLO, hello.as_bytes())
-        .map_err(|e| format!("handshake send failed: {}", e))?;
-
-    // Use shared authentication function
-    let (data_port, session_key, session_state, addr, bootstrap) = authenticate(target)?;
-
-    let session_state_arc = Arc::new(std::sync::Mutex::new(session_state));
-    let dl_state = Arc::new(AtomicU8::new(DL_CONNECTING));
-    let dl_stop = Arc::new(AtomicU8::new(0));
-
-    // Keep the bootstrap session (and with it the data layer child) alive for
-    // the whole GUI session; without this the host tears everything down the
-    // moment authenticate() returns.
-    {
-        let ka_stream = bootstrap;
-        let ka_stop = Arc::clone(&dl_stop);
-        std::thread::spawn(move || bootstrap_keepalive(ka_stream, ka_stop));
-    }
-    let (xfer_tx, xfer_rx) = mpsc::channel::<DlCommand>();
-    let (video_ctrl_tx, video_ctrl_rx) = mpsc::channel::<DlCommand>();
-    
-    // Initialize global video control sender
-    let _ = VIDEO_CONTROL_TX.set(video_ctrl_tx.clone());
-    
-    // Extract callbacks from parameters using mem::replace to avoid borrow checker issues
-    let mut video_cb_inner = std::mem::replace(&mut video_cb, None).expect("video callback required");
-    let video_cb_cell = RefCell::new(Some(video_cb_inner));
-    let mut audio_cb_inner = std::mem::replace(&mut audio_cb, None).expect("audio callback required");
-    let audio_cb_cell = RefCell::new(Some(audio_cb_inner));
-    
-    // Initialize global video control sender
-    let _ = VIDEO_CONTROL_TX.set(video_ctrl_tx.clone());
-
-    // Reconnection loop
-    let mut reconnect_attempts = 0u32;
-    'reconnect_loop: loop {
-        if dl_stop.load(Ordering::Relaxed) == 1 {
-            return Ok(());
-        }
-        
-        // Take callbacks for this connection attempt
-        let mut video_cb = video_cb_cell.borrow_mut().take();
-        let mut audio_cb = audio_cb_cell.borrow_mut().take();
-        
-        let (video_ctrl_tx, video_ctrl_rx) = mpsc::channel::<DlCommand>();
-        let _ = VIDEO_CONTROL_TX.set(video_ctrl_tx.clone());
-        
-        let result = data_link_connect(
-            &ip,
-            &data_port,
-            &session_key,
-            Arc::clone(&dl_state),
-            Arc::clone(&dl_stop),
-            &xfer_rx,
-            &video_ctrl_rx,
-            None,
-            &mut video_cb,
-            &mut audio_cb,
-            &session_state_arc,
-            0, // monitor_index
-            0, // offset_x
-            0, // offset_y
-            0, // width
-            0, // height
-        );
-        
-        // Put callbacks back for potential reconnect
-        *video_cb_cell.borrow_mut() = video_cb;
-        *audio_cb_cell.borrow_mut() = audio_cb;
-        
-        let action = match result {
-            DlLinkResult::Stopped => {
-                dl_stop.store(1, Ordering::Relaxed);
-                return Ok(());
-            }
-            DlLinkResult::Reconnect => {
-                reconnect_attempts += 1;
-                if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
-                    dl_stop.store(1, Ordering::Relaxed);
-                    return Err(format!("max reconnection attempts ({}) reached", MAX_RECONNECT_ATTEMPTS));
-                }
-                println!("  [reconnect] attempt {}/{} in {:?}...", reconnect_attempts, MAX_RECONNECT_ATTEMPTS, RECONNECT_DELAY);
-                dl_state.store(DL_RECONNECTING, Ordering::Relaxed);
-                std::thread::sleep(RECONNECT_DELAY);
-                // Continue loop to re-authenticate and reconnect
-                ReconnectAction::Reconnect
-            }
-            DlLinkResult::Error(e) => {
-                dl_stop.store(1, Ordering::Relaxed);
-                return Err(e);
-            }
-        };
-        
-        if let ReconnectAction::Reconnect = action {
-            continue 'reconnect_loop;
-        }
-    }
-}
-
-enum ReconnectAction {
-    Reconnect,
-}
 
 /// Serves the bootstrap channel while a GUI session runs: answers the host's
 /// PINGs with PONGs so the host keeps this session's data layer alive, and
@@ -763,11 +599,9 @@ pub fn run_session(target: &str, mode: RunMode) -> Result<(), String> {
     // Auth: answer challenges with proofs; secrets never leave this machine.
     // p-mode: derive the same iterated hash the host stores, prove over that.
     // t-mode: the stored token file holds sha256(token); prove over that.
-    let mut sent_token_proof = false;
     let mut attempts = 0u32;
-    let mut session_state: Option<SessionState> = None;
-    let mut data_port = String::new();
-    let mut session_key = String::new();
+    let data_port;
+    let session_key;
     
     loop {
         match expect_frame(&mut stream)? {
@@ -777,32 +611,22 @@ pub fn run_session(target: &str, mode: RunMode) -> Result<(), String> {
                     Some(x) => (x.0.to_string(), x.1.trim().to_string()),
                     None => return Err("malformed challenge from host".into()),
                 };
-                let (mode, proof) = if !sent_token_proof {
-                    sent_token_proof = true;
-                    match token::load_client_token(&user, &ip).filter(|t| t.len() == 64) {
-                        Some(tok_hash) => ("t", creds::compute_proof(&tok_hash, &nonce)),
-                        None => {
-                            // one-shot / scripted runs must never block on a
-                            // hidden console read: fail fast instead of hang
-                            if !creds::stdin_is_tty()
-                                && std::env::var("PYIELINK_SHELL").as_deref() != Ok("1")
-                            {
-                                return Err(format!(
-                                    "no stored credential for {}@{} - run an interactive session once to store a token",
-                                    user, ip
-                                ));
-                            }
-                            ("p", password_proof(&salt, &nonce))
-                        }
-                    }
-                } else {
-                    if attempts >= 3 {
-                        return Err("too many failed authentication attempts".into());
-                    }
-                    attempts += 1;
-                    ("p", password_proof(&salt, &nonce))
-                };
-                let framed = format!("{}:{}", mode, proof);
+                // Password is required on every connection by default;
+                // scripted runs must never block on a hidden console
+                // read: fail fast instead of hang.
+                if !creds::stdin_is_tty()
+                    && std::env::var("PYIELINK_SHELL").as_deref() != Ok("1")
+                {
+                    return Err(format!(
+                        "password required for {}@{} — run from an interactive terminal (or set PYIELINK_SHELL=1 for scripted use)",
+                        user, ip
+                    ));
+                }
+                if attempts >= 3 {
+                    return Err("too many failed authentication attempts".into());
+                }
+                attempts += 1;
+                let framed = format!("p:{}", password_proof(&salt, &nonce));
                 proto::write_frame(&mut stream, PROOF, framed.as_bytes())
                     .map_err(|e| format!("send failed: {}", e))?;
             }
@@ -820,11 +644,8 @@ pub fn run_session(target: &str, mode: RunMode) -> Result<(), String> {
                 proto::write_frame(&mut stream, LICENSE_ACCEPT, b"y")
                     .map_err(|e| e.to_string())?;
             }
-            (TOKEN_ISSUED, payload) => {
-                let tok = String::from_utf8_lossy(&payload).trim().to_string();
-                let path = token::save_client_token(&user, &ip, &token::hash_token(&tok))
-                    .map_err(|e| format!("could not store token: {}", e))?;
-                println!("  [ok] connection credential stored at {}", path.display());
+            (TOKEN_ISSUED, _payload) => {
+                // Not stored: password is required each connection.
             }
             (AUTH_OK, payload) => {
                 let ticket = String::from_utf8_lossy(&payload).into_owned();
@@ -850,8 +671,7 @@ pub fn run_session(target: &str, mode: RunMode) -> Result<(), String> {
     }
     
     // Initialize session state
-    session_state = Some(SessionState::new(user.clone(), ip.clone(), session_key.clone(), data_port.clone()));
-    let session_state_arc = Arc::new(std::sync::Mutex::new(session_state.unwrap()));
+    let session_state_arc = Arc::new(std::sync::Mutex::new(SessionState::new(user.clone(), ip.clone(), session_key.clone(), data_port.clone())));
     let dl_state = Arc::new(AtomicU8::new(DL_CONNECTING));
     let dl_stop = Arc::new(AtomicU8::new(0));
     let xfer_status = Arc::new(AtomicU8::new(XFER_RUN));
@@ -982,7 +802,6 @@ fn dl_parse(buf: &[u8]) -> Option<(u8, &[u8])> {
 enum DlLinkResult {
     Stopped,      // Clean stop via stop flag
     Reconnect,    // Connection lost, should reconnect
-    Error(String), // Unrecoverable error
 }
 
 /// Single data-link connection attempt. Returns DlLinkResult indicating
@@ -1090,7 +909,6 @@ fn data_link_connect(
     }
 
     // control-channel heartbeat: answer server PINGs, send our own, log RTT
-    let mut last_seen = Instant::now();
     // file-transfer state (Phase 3.1)
     let mut transfers: HashMap<u32, Active> = HashMap::new();
     let mut next_id: u32 = 1;
@@ -1149,7 +967,7 @@ fn data_link_connect(
     let mut last_bitrate_request = Instant::now();
     let mut total_video_bytes: u64 = 0;
     let mut bitrate_measurement_start = Instant::now();
-    let mut rtt_estimate: u128 = 50; // initial estimate 50ms
+    let rtt_estimate: u128 = 50; // static estimate until adaptive rework
     
     // control-channel heartbeat: answer server PINGs, send our own, log RTT
     let mut last_seen = Instant::now();
@@ -1331,13 +1149,11 @@ fn data_link_with_reconnect(
     stop: Arc<AtomicU8>,
     cmds: mpsc::Receiver<DlCommand>,
     status: Option<Arc<AtomicU8>>,
-    video_callback: Option<Box<dyn FnMut(&[u8]) + Send>>,
-    audio_callback: Option<Box<dyn FnMut(&[u8]) + Send>>,
+    _video_callback: Option<Box<dyn FnMut(&[u8]) + Send>>,
+    _audio_callback: Option<Box<dyn FnMut(&[u8]) + Send>>,
     session_state: Arc<std::sync::Mutex<SessionState>>,
 ) {
     let mut reconnect_attempts = 0u32;
-    let mut video_callback = video_callback;
-    let mut audio_callback = audio_callback;
     let (_, video_ctrl_rx) = mpsc::channel::<DlCommand>(); // unused in shell mode
     loop {
         if stop.load(Ordering::Relaxed) == 1 {
@@ -1385,11 +1201,6 @@ fn data_link_with_reconnect(
                 // The outer run_session loop will handle re-authentication
                 // and call data_link_with_reconnect again with new credentials
                 return; // Exit to let run_session re-authenticate
-            }
-            DlLinkResult::Error(e) => {
-                eprintln!("  [dl-link] error: {}", e);
-                state.store(DL_DEAD, Ordering::Relaxed);
-                return;
             }
         }
     }

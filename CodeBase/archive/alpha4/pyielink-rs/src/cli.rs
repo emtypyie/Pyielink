@@ -2,8 +2,6 @@ use std::env;
 use std::process;
 
 use pyielink::creds::{add_to_whitelist, remove_from_whitelist, add_user, cmd_enable_with_flags};
-use pyielink::tunnel::{TunnelManager, tunnel_manager, TunnelType};
-use pyielink::RunMode;
 
 fn print_usage() {
     eprintln!("usage: pyielink <command> [args...]");

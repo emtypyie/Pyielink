@@ -68,7 +68,7 @@ unsafe extern "system" fn keyboard_hook_proc(n_code: i32, w_param: WPARAM, l_par
         if let Some(tx) = INPUT_TX.get() {
             if let Some(running) = INPUT_RUNNING.get() {
                 if running.load(Ordering::Relaxed) {
-                    let kbd = &*(l_param.0 as *const KBDLLHOOKSTRUCT);
+                    let kbd = unsafe { &*(l_param.0 as *const KBDLLHOOKSTRUCT) };
                     let vk = kbd.vkCode as u16;
                     let scan = kbd.scanCode as u16;
                     let flags = kbd.flags.0 as u32;
@@ -84,7 +84,7 @@ unsafe extern "system" fn keyboard_hook_proc(n_code: i32, w_param: WPARAM, l_par
             }
         }
     }
-    CallNextHookEx(None, n_code, w_param, l_param)
+    unsafe { CallNextHookEx(None, n_code, w_param, l_param) }
 }
 
 unsafe extern "system" fn mouse_hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
@@ -92,7 +92,7 @@ unsafe extern "system" fn mouse_hook_proc(n_code: i32, w_param: WPARAM, l_param:
         if let Some(tx) = INPUT_TX.get() {
             if let Some(running) = INPUT_RUNNING.get() {
                 if running.load(Ordering::Relaxed) {
-                    let mouse = &*(l_param.0 as *const MSLLHOOKSTRUCT);
+                    let mouse = unsafe { &*(l_param.0 as *const MSLLHOOKSTRUCT) };
                     let x = mouse.pt.x;
                     let y = mouse.pt.y;
                     let mouse_data = mouse.mouseData;
@@ -116,7 +116,7 @@ unsafe extern "system" fn mouse_hook_proc(n_code: i32, w_param: WPARAM, l_param:
                             InputEvent::MouseUp { button, x, y, flags: 0 }
                         }
                         _ => {
-                            return CallNextHookEx(None, n_code, w_param, l_param);
+                            return unsafe { CallNextHookEx(None, n_code, w_param, l_param) };
                         }
                     };
 
@@ -125,5 +125,5 @@ unsafe extern "system" fn mouse_hook_proc(n_code: i32, w_param: WPARAM, l_param:
             }
         }
     }
-    CallNextHookEx(None, n_code, w_param, l_param)
+    unsafe { CallNextHookEx(None, n_code, w_param, l_param) }
 }
