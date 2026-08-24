@@ -460,27 +460,80 @@ pub fn run_connect(target: &str, repl_mode: bool) -> Result<(), String> {
     if repl_mode {
         run_session(target, RunMode::Shell)
     } else {
-        // GUI mode: feed the H.264/MPEG-TS stream from the data link into a
-        // decoder + window. The window is created up-front and shows a
-        // "Connecting…" placeholder until real frames arrive.
-        let title = "Pyielink — Remote Screen".to_string();
-        let mut win: Option<crate::video_window::VideoWindow> = match crate::video_window::VideoWindow::new(&title) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                println!("  [warn] {} — continuing without video window", e);
-                None
+        // GUI mode: Rust handles only the bootstrap handshake + session
+        // keepalive; the data link (video window included) is served by the
+        // bundled Node viewer (datalayer/src/client_view.js).
+        run_gui_session_node(target)
+    }
+}
+
+/// Resolve datalayer/src/client_view.js next to this install.
+fn gui_viewer_script() -> Option<std::path::PathBuf> {
+    if let Ok(base) = std::env::var("PYIELINK_DATALAYER") {
+        let base = std::path::PathBuf::from(base);
+        let p = base.join("datalayer").join("src").join("client_view.js");
+        if p.exists() {
+            return Some(p);
+        }
+        let p = base.join("src").join("client_view.js");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let mut anc = exe.parent().map(|p| p.to_path_buf());
+        for _ in 0..2 {
+            if let Some(dir) = anc {
+                let p = dir.join("datalayer").join("src").join("client_view.js");
+                if p.exists() {
+                    return Some(p);
+                }
+                anc = dir.parent().map(|p| p.to_path_buf());
             }
-        };
-        let video_cb: Box<dyn FnMut(&[u8]) + Send> = Box::new(move |chunk: &[u8]| {
-            if let Some(w) = win.as_mut() {
-                w.push_ts(chunk);
-                w.pump();
-            }
-        });
-        let audio_cb: Box<dyn FnMut(&[u8]) + Send> = Box::new(|_chunk: &[u8]| {
-            // Audio playback is handled separately; ignore raw Opus here.
-        });
-        run_gui_session(target, Some(video_cb), Some(audio_cb))
+        }
+    }
+    None
+}
+
+/// GUI session: bootstrap auth (Rust) + Node viewer process for everything else.
+fn run_gui_session_node(target: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    let script = gui_viewer_script().ok_or_else(|| {
+        "viewer not found: datalayer/src/client_view.js missing from this install".to_string()
+    })?;
+
+    // Authenticate and get the data-layer ticket.
+    let (data_port, session_key, session_state, _addr, bootstrap_stream) = authenticate(target)?;
+
+    // Keep the bootstrap session alive while the viewer runs — the host tears
+    // the data layer down the moment this socket dies.
+    let stop = Arc::new(AtomicU8::new(0));
+    let ka_stop = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        bootstrap_keepalive(bootstrap_stream, ka_stop);
+    });
+
+    println!("  [i] launching video viewer …");
+    let status = Command::new("node")
+        .arg(&script)
+        .arg("--host")
+        .arg(session_state.ip.clone())
+        .arg("--port")
+        .arg(&data_port)
+        .arg("--key")
+        .arg(&session_key)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .and_then(|mut c| c.wait())
+        .map_err(|e| format!("cannot start viewer (is Node installed?): {}", e))?;
+
+    stop.store(1, Ordering::Relaxed);
+    match status.code() {
+        Some(0) | None => Ok(()),
+        Some(c) => Err(format!("viewer exited with code {}", c)),
     }
 }
 
@@ -1103,7 +1156,6 @@ fn data_link_connect(
     // file-transfer state (Phase 3.1)
     let mut transfers: HashMap<u32, Active> = HashMap::new();
     let mut next_id: u32 = 1;
-    eprintln!("[vdbg] main loop entered");
     let up_since = Instant::now();
     static NO_VIDEO_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1168,20 +1220,9 @@ fn data_link_connect(
                 Some((DL_CH_META, payload)) => handle_meta_json(payload, &mut ws, &mut transfers, &status),
                 Some((DL_CH_CHUNK, payload)) => handle_chunk(payload, &mut ws, &mut transfers, &status),
                 Some((DL_CH_VIDEO, payload)) => {
-                    if total_video_bytes == 0 {
-                        eprintln!("[vdbg] first video chunk ({} bytes)", payload.len());
-                    }
                     total_video_bytes += payload.len() as u64;
-                    if total_video_bytes / (256 * 1024) > (total_video_bytes - payload.len() as u64) / (256 * 1024) {
-                        eprintln!("[vdbg] video bytes so far: {} KiB", total_video_bytes / 1024);
-                    }
                     if let Some(cb) = video_callback.as_mut() {
                         cb(payload);
-                    } else {
-                        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                            eprintln!("[vdbg] NO video callback wired!");
-                        }
                     }
                 }
                 Some((DL_CH_AUDIO, payload)) => {
@@ -1189,12 +1230,7 @@ fn data_link_connect(
                         cb(payload);
                     }
                 }
-                _ => {
-                    static UNK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                    if !UNK.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        eprintln!("[vdbg] dropped frame: len={} ch0={:?}", buf.len(), buf.first());
-                    }
-                } // unknown channel: drop silently (mirrors mux policy)
+                _ => {} // unknown channel: drop silently (mirrors mux policy)
             },
             Ok(Message::Close(_)) | Ok(Message::Frame(_)) => {
                 println!("  [dl-link] data layer closed the channel");
