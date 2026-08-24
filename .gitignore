@@ -1,5 +1,4 @@
-contex.md
-plan.md
+*.md
 CodeBase/**/target/
 *_host_*.log
 _*.log
