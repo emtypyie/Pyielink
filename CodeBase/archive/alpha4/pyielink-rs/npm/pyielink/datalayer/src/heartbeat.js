@@ -31,7 +31,8 @@ export class Heartbeat {
 
   _onControl(payload) {
     const text = payload.toString("utf8");
-    if (text === "PING") {
+    if (text === "PING" || text === "P") {
+      // Peer heartbeat probe (legacy single-char or full word): answer PONG.
       this.misses = 0;
       this.mux.send(CHANNELS.CONTROL, PONG);
       return;
@@ -43,7 +44,8 @@ export class Heartbeat {
       if (this.onRtt) this.onRtt(this.rttMs);
       return;
     }
-    this.mux.send(CHANNELS.CONTROL, payload);
+    // Unknown control payloads are ignored (never echoed) so a chatty peer
+    // cannot create an infinite ping-pong loop.
   }
 
   _tick() {
