@@ -20,6 +20,7 @@ export class InputService {
         this.log = log || (() => {});
         this.active = false;
         this.injector = null;
+        this.eventCount = 0;
 
         mux.on(CHANNELS.INPUT, (payload) => this._handleInput(payload));
     }
@@ -46,6 +47,10 @@ export class InputService {
 
             for (const ev of events) {
                 const line = JSON.stringify(ev);
+                this.eventCount += 1;
+                if (this.eventCount === 1 || this.eventCount % 50 === 0) {
+                    this.log(`[input] received ${this.eventCount} events (last: ${line.slice(0, 80)})`);
+                }
                 try {
                     this.injector.stdin.write(line + "\n");
                 } catch {
@@ -80,6 +85,7 @@ export class InputService {
     stop() {
         if (!this.active) return;
         this.active = false;
+        if (this.eventCount > 0) this.log(`[input] session total: ${this.eventCount} events`);
         if (this.injector) {
             try { this.injector.kill(); } catch {}
             this.injector = null;

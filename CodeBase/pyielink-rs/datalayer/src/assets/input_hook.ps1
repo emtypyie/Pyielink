@@ -1,6 +1,7 @@
 param(
   [string]$ProcName = "ffplay",
-  [Parameter(Mandatory = $true)][int]$UdpPort
+  [Parameter(Mandatory = $true)][int]$UdpPort,
+  [string]$Trace = ""
 )
 # Client-side input capture for the ffplay viewer.
 #
@@ -12,10 +13,19 @@ param(
 # Button/wheel/key events are SWALLOWED while captured so ffplay itself
 # never reacts (its hotkeys would toggle pause/fullscreen/quit). Mouse
 # MOVES are never swallowed - that would break system cursor motion.
+#
+# Every milestone appends to $Trace (if given) so failures are never silent.
 
 $ErrorActionPreference = 'SilentlyContinue'
 
-Add-Type -TypeDefinition @'
+function Tr([string]$m) {
+  if ($Trace) { try { Add-Content -LiteralPath $Trace -Value "$(Get-Date -Format HH:mm:ss.fff) $m" } catch {} }
+}
+
+Tr "start pid=$PID proc=$ProcName udp=$UdpPort"
+
+try {
+  Add-Type -TypeDefinition @'
 using System;
 using System.Diagnostics;
 using System.Net.Sockets;
@@ -52,33 +62,67 @@ public static class PIKHook {
             WM_RBUTTONDOWN = 0x204, WM_RBUTTONUP = 0x205, WM_MOUSEWHEEL = 0x20A;
   const int WM_KEYDOWN = 0x100, WM_KEYUP = 0x101, WM_SYSKEYDOWN = 0x104, WM_SYSKEYUP = 0x105;
 
+  // Must match inject.ps1's EXTRA_MAGIC. Events carrying this marker were
+  // injected by OUR OWN host-side SendInput - never capture, never swallow.
+  static readonly IntPtr EXTRA_MAGIC = (IntPtr)0x50494B31;
+
   static UdpClient udp;
   static IntPtr target = IntPtr.Zero;
   static IntPtr mouseHook = IntPtr.Zero, kbdHook = IntPtr.Zero;
   static int lastMoveTick = 0;
+  // Diagnostics surfaced to the PS wrapper after Run() returns.
+  public static long MouseSent = 0, KeySent = 0;
+  public static string LastError = "";
+  static string trace = "";
 
-  public static void Run(string procName, int port) {
-    udp = new UdpClient();
-    udp.Connect("127.0.0.1", port);
+  static void Tr(string m) {
+    if (trace.Length == 0) return;
+    try { System.IO.File.AppendAllText(trace, DateTime.Now.ToString("HH:mm:ss.fff") + " " + m + "\r\n"); } catch {}
+  }
+
+  public static void Run(string procName, int port, string tracePath) {
+    trace = tracePath ?? "";
+    try {
+      udp = new UdpClient();
+      udp.Connect("127.0.0.1", port);
+    } catch (Exception e) {
+      LastError = "udp connect: " + e.Message;
+      Tr("FATAL " + LastError);
+      return;
+    }
+    Tr("udp connected, waiting for window");
 
     for (int i = 0; i < 120 && !FindTarget(procName); i++) Thread.Sleep(250);
-    if (target == IntPtr.Zero) return;
+    if (target == IntPtr.Zero) { LastError = "window never appeared"; Tr("FATAL " + LastError); return; }
+    Tr("window found hwnd=" + target);
 
     mouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseProc, IntPtr.Zero, 0);
     kbdHook = SetWindowsHookEx(WH_KEYBOARD_LL, KbdProc, IntPtr.Zero, 0);
+    if (mouseHook == IntPtr.Zero || kbdHook == IntPtr.Zero) {
+      LastError = "SetWindowsHookEx failed mouse=" + mouseHook + " kbd=" + kbdHook;
+      Tr("FATAL " + LastError);
+      return;
+    }
+    Tr("hooks installed, capturing");
 
     uint tid = GetCurrentThreadId();
+    long lastLogged = -1;
     new Thread(() => {
-      while (IsWindow(target)) Thread.Sleep(500);
+      while (IsWindow(target)) {
+        Thread.Sleep(2000);
+        long total = MouseSent + KeySent;
+        if (total != lastLogged) { lastLogged = total; Tr("captured: mouse=" + MouseSent + " key=" + KeySent); }
+      }
       PostThreadMessage(tid, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
     }) { IsBackground = true }.Start();
 
     MSG m;
-    while (GetMessage(out m, IntPtr.Zero, 0, 0)) { }
+    while (GetMessage(out m, IntPtr.Zero, 0, 0) > 0) { }
 
     if (mouseHook != IntPtr.Zero) UnhookWindowsHookEx(mouseHook);
     if (kbdHook != IntPtr.Zero) UnhookWindowsHookEx(kbdHook);
     udp.Close();
+    Tr("hooks removed, exiting");
   }
 
   static bool FindTarget(string procName) {
@@ -107,7 +151,7 @@ public static class PIKHook {
 
   static void SendJson(string s) {
     byte[] b = Encoding.UTF8.GetBytes(s);
-    try { udp.Send(b, b.Length); } catch {}
+    try { udp.Send(b, b.Length); } catch (Exception e) { LastError = "udp send: " + e.Message; }
   }
 
   static void SendMouse(string type, int sx, int sy, int wheelDelta) {
@@ -130,6 +174,7 @@ public static class PIKHook {
     if (code >= 0) {
       int msg = wParam.ToInt32();
       MSLLHOOKSTRUCT info = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+      if (info.extra == EXTRA_MAGIC) return CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
       if (Capturing(info.pt)) {
         switch (msg) {
           case WM_MOUSEMOVE: {
@@ -138,16 +183,18 @@ public static class PIKHook {
             if (now - lastMoveTick >= 15) {
               lastMoveTick = now;
               SendMouse("move", info.pt.x, info.pt.y, 0);
+              MouseSent++;
             }
             break;
           }
-          case WM_LBUTTONDOWN: SendMouse("ldown", info.pt.x, info.pt.y, 0); return (IntPtr)1;
-          case WM_LBUTTONUP:   SendMouse("lup",   info.pt.x, info.pt.y, 0); return (IntPtr)1;
-          case WM_RBUTTONDOWN: SendMouse("rdown", info.pt.x, info.pt.y, 0); return (IntPtr)1;
-          case WM_RBUTTONUP:   SendMouse("rup",   info.pt.x, info.pt.y, 0); return (IntPtr)1;
+          case WM_LBUTTONDOWN: SendMouse("ldown", info.pt.x, info.pt.y, 0); MouseSent++; return (IntPtr)1;
+          case WM_LBUTTONUP:   SendMouse("lup",   info.pt.x, info.pt.y, 0); MouseSent++; return (IntPtr)1;
+          case WM_RBUTTONDOWN: SendMouse("rdown", info.pt.x, info.pt.y, 0); MouseSent++; return (IntPtr)1;
+          case WM_RBUTTONUP:   SendMouse("rup",   info.pt.x, info.pt.y, 0); MouseSent++; return (IntPtr)1;
           case WM_MOUSEWHEEL: {
             short d = (short)((info.mouseData >> 16) & 0xFFFF);
             SendMouse("wheel", info.pt.x, info.pt.y, d);
+            MouseSent++;
             return (IntPtr)1;
           }
         }
@@ -160,6 +207,7 @@ public static class PIKHook {
     if (code >= 0) {
       int msg = wParam.ToInt32();
       KBDLLHOOKSTRUCT k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+      if (k.extra == EXTRA_MAGIC) return CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
       // Let Alt / Win combos through untouched (Alt-Tab, Win-L, ...) - do
       // not capture, do not swallow.
       uint vk = k.vkCode;
@@ -168,6 +216,7 @@ public static class PIKHook {
       if (!modifierPass && IsWindow(target) && GetForegroundWindow() == target) {
         bool up = (msg == WM_KEYUP || msg == WM_SYSKEYUP);
         SendJson("{\"t\":\"key\",\"vk\":" + vk + ",\"up\":" + (up ? "true" : "false") + "}");
+        KeySent++;
         return (IntPtr)1;  // swallow: ffplay must never see q/space/f/esc
       }
     }
@@ -175,5 +224,15 @@ public static class PIKHook {
   }
 }
 '@
+} catch {
+  Tr "FATAL Add-Type: $_"
+  exit 1
+}
+Tr "types loaded"
 
-[PIKHook]::Run($ProcName, $UdpPort)
+try {
+  [PIKHook]::Run($ProcName, $UdpPort, $Trace)
+  Tr "run returned: mouse=$([PIKHook]::MouseSent) key=$([PIKHook]::KeySent) err=$([PIKHook]::LastError)"
+} catch {
+  Tr "FATAL: $_"
+}

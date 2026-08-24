@@ -32,6 +32,11 @@ public static class PIKInj {
              F_ABSOLUTE = 0x8000;
   const uint F_KEYUP = 0x0002;
 
+  // Marker written into dwExtraInfo of every injected event. The client-side
+  // low-level hooks check for it and ignore our own injections - otherwise
+  // capture -> inject -> recapture becomes an exponential feedback loop.
+  public static readonly IntPtr EXTRA_MAGIC = (IntPtr)0x50494B31;  // "PIK1"
+
   // flags: full SendInput flag set for this event; data: wheel delta bits.
   public static uint Mouse(int nx, int ny, uint flags, uint data) {
     INPUT[] a = new INPUT[1];
@@ -40,6 +45,7 @@ public static class PIKInj {
     a[0].u.mi.dy = ny;
     a[0].u.mi.mouseData = data;
     a[0].u.mi.dwFlags = flags;
+    a[0].u.mi.extra = EXTRA_MAGIC;
     return SendInput(1, a, Marshal.SizeOf(typeof(INPUT)));
   }
 
@@ -47,6 +53,7 @@ public static class PIKInj {
     INPUT[] a = new INPUT[1];
     a[0].type = INPUT_KEYBOARD;
     a[0].u.ki.wVk = vk;
+    a[0].u.ki.extra = EXTRA_MAGIC;
     if (up) a[0].u.ki.dwFlags = F_KEYUP;
     return SendInput(1, a, Marshal.SizeOf(typeof(INPUT)));
   }

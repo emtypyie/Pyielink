@@ -127,6 +127,9 @@ export class VideoService {
 
         const args = [
             "-f", inputFormat,
+            // Input options MUST precede -i: this sets how fast gdigrab polls
+            // the screen. Output framerate below then matches it.
+            "-framerate", "45",
             ...inputOpts,
             "-i", inputArg,
             "-f", "mpegts",
@@ -136,8 +139,8 @@ export class VideoService {
             "-b:v", `${bitrateKbps}k`,
             "-maxrate", `${maxrateKbps}k`,
             "-bufsize", `${bufsizeKbps}k`,
-            "-g", "30",
-            "-framerate", "30",
+            "-framerate", "45",
+            "-g", "90",
             "-pix_fmt", "yuv420p",
             "-fflags", "nobuffer+genpts",
             "-flags", "low_delay",

@@ -90,8 +90,8 @@ function ensureViewer() {
   const iconImg = existsSync(a("PyieLink1.png")) ? a("PyieLink1.png") : a("PyieLink.ico");
   let proc;
   let kind;
-  // TEMP DIAGNOSTIC: capture the player's own stderr verbosely so we can see
-  // exactly why it dies inside a session (isolation repro says args are fine).
+  // Player stderr goes to a rolling temp file - keeps field debugging
+  // possible without spamming the console.
   const ffLog = openSync(process.env.TEMP + "\\pyielink-ffplay.log", "a");
   try { writeSync(ffLog, `\n==== viewer spawn ${new Date().toISOString()} ====\n`); } catch {}
   const common = [
@@ -101,7 +101,7 @@ function ensureViewer() {
     "-probesize", "32",
     "-analyzeduration", "0",
     "-window_title", "Pyielink - Remote Screen",
-    "-loglevel", "verbose",
+    "-loglevel", "error",
     "-nostats",
     "-i", "pipe:0",
   ];
@@ -191,13 +191,14 @@ function startInputRelay(ws) {
     const helper = spawn(
       "powershell",
       ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
-       "-ProcName", "ffplay", "-UdpPort", String(port)],
-      { stdio: "ignore", detached: true }
+       "-ProcName", "ffplay", "-UdpPort", String(port),
+       "-Trace", process.env.TEMP + "\\pyielink-hook.log"],
+      { stdio: "ignore" }
     );
-    helper.unref();
     inputHelper = helper;
     inputUdp = sock;
     log(`input relay up (udp:${port}, pid:${helper.pid})`);
+    helper.on("exit", (c) => log(`input helper exited (code ${c})`));
   });
 }
 
