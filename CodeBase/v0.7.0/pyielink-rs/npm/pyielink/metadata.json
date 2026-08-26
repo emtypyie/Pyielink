@@ -1,0 +1,24 @@
+{
+  "name": "Pyielink",
+  "version": "0.5.0",
+  "repo": "EMTYPYIE/Pyielink",
+  "description": "Pyielink remote access framework — screen sharing, file transfer, and terminal access",
+  "download": "https://cdn.emtypyie.in/dev/pyielink-v0.5.0-windows-x64.exe",
+  "filename": "pyielink-v0.5.0-windows-x64.exe",
+  "info": "Pyielink v0.5.0 remote access framework\n\nConnect to remote host via: pyielink user@ip\n\nFeatures:\n- Screen sharing with FFmpeg + openh264\n- Audio capture and playback via FFmpeg/Opus\n- File transfer with resume support\n- Multi-monitor selection and focus-gated capture\n- Adaptive bitrate and frame pacing\n- IP whitelist and --all tunneling flags\n- Persistent token-based authentication\n- On-screen OSD overlay (FPS, bitrate, RTT, input stats)\n- In-app file browser with SVG icons\n\nConnect:\n  pyielink user@192.168.1.100    # GUI mode\n  pyielink --repl user@192.168.1.100  # REPL terminal mode\n  pyielink enable                 # Enable host for connections\n  pyielink enable --all           # Open host to any IP\n  pyielink enable --whitelist IP  # Allow specific IP only\n  pyielink whitelist add IP       # Add IP to persistent whitelist\n  pyielink whitelist remove IP    # Remove IP from whitelist\n\nFirst run: npm install -g pyielink\n  Downloads Rust binary from CDN and sets up configuration.\n\nDocs:  https://github.com/EMTYPYIE/Pyielink\nSupport: Issues https://github.com/EMTYPYIE/Pyielink/issues",
+  "cdn_pattern": "pyielink-v0.5.0-{platform}-{arch}{ext}",
+  "platforms": {
+    "windows": "x64",
+    "linux": "x64", 
+    "darwin": "arm64,x64"
+  },
+  "commands": [
+    "pyielink <user@ip>",
+    "pyielink --repl <user@ip>",
+    "pyielink enable",
+    "pyielink enable --all",
+    "pyielink enable --whitelist <ip>",
+    "pyielink whitelist add <ip>",
+    "pyielink whitelist remove <ip>"
+  ]
+}

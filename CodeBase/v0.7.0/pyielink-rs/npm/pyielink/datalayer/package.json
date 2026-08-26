@@ -1,0 +1,14 @@
+{
+  "name": "pyielink-datalayer",
+  "version": "0.1.0-alpha.4",
+  "private": true,
+  "type": "module",
+  "description": "pyielink data layer: per-session ws multiplexer on port 4243",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js --port 4243"
+  },
+  "dependencies": {
+    "ws": "8.18.0"
+  }
+}
