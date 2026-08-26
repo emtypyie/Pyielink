@@ -8,6 +8,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("commands:");
     eprintln!("  user@ip                   Connect to host (GUI mode)");
+    eprintln!("  user@ip --repl            Connect to host (REPL terminal mode)");
     eprintln!("  --repl user@ip            Connect to host (REPL terminal mode)");
     eprintln!("  enable                  Enable host for connections");
     eprintln!("  enable --all             Enable host for connections from any IP");
@@ -37,6 +38,24 @@ fn main() {
     if args.is_empty() {
         print_usage();
         process::exit(1);
+    }
+
+    // --repl may appear as `pyielink --repl user@ip` or `pyielink user@ip --repl` (user request)
+    if args.iter().any(|a| a == "--repl") {
+        let target = args.iter().find(|a| *a != "--repl" && a.contains('@'));
+        match target {
+            Some(t) => {
+                if let Err(e) = pyielink::client::run_connect(t, true) {
+                    eprintln!("  [error] connection failed: {}", e);
+                    process::exit(1);
+                }
+                return;
+            }
+            None => {
+                eprintln!("  [error] usage: pyielink user@ip --repl  or  pyielink --repl user@ip");
+                process::exit(1);
+            }
+        }
     }
 
     let command = &args[0];
@@ -131,18 +150,6 @@ fn main() {
                     print_usage();
                     process::exit(1);
                 }
-            }
-        }
-
-        "--repl" => {
-            if args.len() < 2 {
-                eprintln!("  [error] usage: pyielink --repl user@ip");
-                process::exit(1);
-            }
-            let target = &args[1];
-            if let Err(e) = pyielink::client::run_connect(target, true) {
-                eprintln!("  [error] connection failed: {}", e);
-                process::exit(1);
             }
         }
 

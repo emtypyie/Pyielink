@@ -340,7 +340,8 @@ Pyielink remote access framework v` + pkg.version + `
 
 Usage:
   pyielink <user@ip>               Connect to host (GUI mode)
-  pyielink --repl user@ip          REPL terminal mode
+  pyielink <user@ip> --repl        REPL terminal mode
+  pyielink --repl <user@ip>        REPL terminal mode (alt)
   pyielink enable                  Enable host for connections
   pyielink enable --all            Enable host for any IP
   pyielink enable --whitelist IP   Allow specific IP only
@@ -351,9 +352,10 @@ First run: npm install -g pyielink
   This will download the Rust binary from GitHub and set up configuration.
 
 After installation, run:
-  pyielink user@192.168.1.100    # Connect GUI
-  pyielink --repl user@192.168.1.100  # Connect REPL
-  pyielink enable                 # Enable host on first run
+  pyielink user@192.168.1.100          # Connect GUI
+  pyielink user@192.168.1.100 --repl  # Connect REPL
+  pyielink --repl user@192.168.1.100  # Connect REPL (alt)
+  pyielink enable                       # Enable host on first run
 `);
   process.exit(0);
 }
