@@ -1,6 +1,6 @@
 ﻿{
     "name":  "pyielink",
-    "version":  "0.6.11",
+    "version": "0.6.12",
     "description":  "Pyielink remote access framework Ã¢â‚¬â€ connect to host via screen sharing, file transfer, and terminal",
     "main":  "cli.js",
     "bin":  {

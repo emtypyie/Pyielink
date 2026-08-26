@@ -4,7 +4,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { execSync, spawn } = require("child_process");
+const { execSync, spawn, spawnSync } = require("child_process");
 
 // cli.js lives in the package root (sibling of package.json) both for
 // local installs (node_modules/pyielink/cli.js) and global installs.
@@ -298,6 +298,19 @@ function runPyielink(args) {
       PYIELINK_HOME: getPyielinkDir(),
       PYIELINK_DATALAYER: PACKAGE_DIR,
     };
+    // For REPL we need a true interactive stdio (Node's execSync can buffer on Windows).
+    // Use spawnSync with inherit for REPL so stdin_is_tty and prompts work.
+    if (args.includes("--repl")) {
+      const result = spawnSync(binaryPath, args, {
+        cwd: process.cwd(),
+        env,
+        stdio: "inherit",
+      });
+      if (result.status !== 0 && result.status !== null) {
+        process.exit(result.status);
+      }
+      return;
+    }
     // Forward all CLI args to the Rust binary. Quote each token so paths
     // and addresses with special characters are passed through intact.
     const cmd = [binaryPath, ...args].map((a) => `"${a}"`).join(" ");
@@ -318,6 +331,7 @@ const args = process.argv.slice(2);
 
 if (args.includes("--repl")) {
   process.env.PYIELINK_REPL = "1";
+  process.env.PYIELINK_SHELL = "1";
 }
 
 if (args[0] === "--help" || args[0] === "-h") {

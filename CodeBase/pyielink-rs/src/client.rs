@@ -616,6 +616,8 @@ pub fn run_session(target: &str, mode: RunMode) -> Result<(), String> {
                 // read: fail fast instead of hang.
                 if !creds::stdin_is_tty()
                     && std::env::var("PYIELINK_SHELL").as_deref() != Ok("1")
+                    && std::env::var("PYIELINK_REPL").as_deref() != Ok("1")
+                    && !matches!(mode, RunMode::Shell)
                 {
                     return Err(format!(
                         "password required for {}@{} — run from an interactive terminal (or set PYIELINK_SHELL=1 for scripted use)",
@@ -715,6 +717,8 @@ pub fn run_session(target: &str, mode: RunMode) -> Result<(), String> {
     }
     
     let interactive = std::env::var("PYIELINK_SHELL").ok().as_deref() == Some("1")
+        || std::env::var("PYIELINK_REPL").ok().as_deref() == Some("1")
+        || matches!(mode, RunMode::Shell)
         || creds::stdin_is_tty();
     let input_running = Arc::new(AtomicBool::new(false));
     let mut input_handle: Option<std::thread::JoinHandle<()>> = None;
