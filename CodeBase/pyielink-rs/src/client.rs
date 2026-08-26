@@ -1011,8 +1011,8 @@ fn data_link_connect(
             }
         }
         
-        // Adaptive bitrate: send bitrate request every 5 seconds based on measured throughput
-        if last_bitrate_request.elapsed() >= BITRATE_REQUEST_INTERVAL {
+        // Adaptive bitrate: only for video sessions (Shell has no video)
+        if video_callback.is_some() && last_bitrate_request.elapsed() >= BITRATE_REQUEST_INTERVAL {
             let estimated_kbps = estimate_bandwidth_kbps(total_video_bytes, Instant::now() - bitrate_measurement_start, rtt_estimate);
             let target_kbps = calculate_target_bitrate(estimated_kbps, rtt_estimate);
             
@@ -1020,7 +1020,10 @@ fn data_link_connect(
             if ws.send(Message::Binary(dl_frame(DL_CH_VIDEO, json.as_bytes()))).is_err() {
                 eprintln!("  [adaptive] bitrate request send failed");
             } else {
-                println!("  [adaptive] bitrate request: estimated={} kbps, target={} kbps, rtt={}ms", estimated_kbps, target_kbps, rtt_estimate);
+                // Quiet in Shell REPL — video bitrate spam clobbers the prompt
+                if video_callback.is_some() {
+                    println!("  [adaptive] bitrate request: estimated={} kbps, target={} kbps, rtt={}ms", estimated_kbps, target_kbps, rtt_estimate);
+                }
             }
             last_bitrate_request = Instant::now();
             // Reset measurement window
@@ -1065,7 +1068,8 @@ fn data_link_connect(
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    if total_video_bytes == 0
+                    if video_callback.is_some()
+                        && total_video_bytes == 0
                         && up_since.elapsed() >= Duration::from_secs(8)
                         && !NO_VIDEO_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
                     {
@@ -1828,10 +1832,13 @@ fn post_auth_loop(
         match proto::read_frame(stream) {
             Ok((PING, payload)) => {
                 last_ping_seen = Instant::now();
-                if let Ok(sent) = String::from_utf8_lossy(&payload).trim().parse::<u128>() {
-                    println!("  [hb] rtt {}ms", now_ms().saturating_sub(sent));
-                } else {
-                    println!("  [hb] alive");
+                // In Shell REPL, heartbeat spam overwrites the pyielink> prompt — keep it quiet
+                if !matches!(mode, RunMode::Shell) {
+                    if let Ok(sent) = String::from_utf8_lossy(&payload).trim().parse::<u128>() {
+                        println!("  [hb] rtt {}ms", now_ms().saturating_sub(sent));
+                    } else {
+                        println!("  [hb] alive");
+                    }
                 }
                 if proto::write_frame(stream, PONG, &payload).is_err() {
                     return Err("lost connection to host".into());
