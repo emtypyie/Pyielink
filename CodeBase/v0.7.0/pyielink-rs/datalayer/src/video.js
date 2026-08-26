@@ -1,9 +1,43 @@
 import { CHANNELS } from "./mux.js";
-import { spawn } from "child_process";
+import { spawn, execSync } from "child_process";
+import { performance } from "node:perf_hooks";
+import { appendFileSync } from "node:fs";
 
-const CHUNK_SIZE = 64 * 1024;
+const CHUNK_SIZE = 1200; // MTU-friendly: 1200B < 1500 MTU, vs 64K bursty (NALU slicer)
 const FFMPEG_RESTART_DELAY = 2000;
 const MAX_RESTARTS = 5;
+const LATENCY_CSV = (process.env.TEMP || ".") + "\\pyielink-latency.csv";
+function latencyLog(stage, ms, extra="") {
+  try {
+    const line = `${Date.now()},${stage},${ms.toFixed(2)},${extra}\n`;
+    appendFileSync(LATENCY_CSV, line);
+  } catch {}
+}
+let hwProbeCache = null;
+function probeHardware(log) {
+  if (hwProbeCache) return hwProbeCache;
+  const res = { ddagrab: false, encoders: [], hwaccels: [] };
+  try {
+    const enc = execSync("ffmpeg -hide_banner -encoders 2>&1", { timeout: 3000 }).toString();
+    if (enc.includes("h264_nvenc")) res.encoders.push("h264_nvenc");
+    if (enc.includes("hevc_nvenc")) res.encoders.push("hevc_nvenc");
+    if (enc.includes("h264_qsv")) res.encoders.push("h264_qsv");
+    if (enc.includes("h264_amf")) res.encoders.push("h264_amf");
+  } catch {}
+  try {
+    const hw = execSync("ffmpeg -hide_banner -hwaccels 2>&1", { timeout: 3000 }).toString();
+    res.hwaccels = hw.split(/\W+/).filter(Boolean);
+  } catch {}
+  try {
+    const fmts = execSync("ffmpeg -hide_banner -formats 2>&1", { timeout: 3000 }).toString();
+    if (fmts.includes("ddagrab")) res.ddagrab = true;
+  } catch {}
+  // Also check gdigrab always available on Windows
+  hwProbeCache = res;
+  try { log(`[video] hw probe: ddagrab=${res.ddagrab} encoders=[${res.encoders.join(",")}] hwaccels=[${res.hwaccels.join(",")}]`); } catch {}
+  latencyLog("hw_probe", 0, `ddagrab=${res.ddagrab},enc=${res.encoders.join("|")}`);
+  return res;
+}
 
 export class VideoService {
     constructor(mux, session, log) {
@@ -21,7 +55,10 @@ export class VideoService {
         this.monitorWidth = 0;
         this.monitorHeight = 0;
         this.paused = false;
-        
+        this._spawnTime = 0;
+        this._frameCount = 0;
+        // latency CSV header
+        try { appendFileSync(LATENCY_CSV, "ts,stage,ms,extra\n"); } catch {}
         // Adaptive bitrate
         this.currentBitrate = 5000; // kbps
         this.minBitrate = 500; // kbps
@@ -109,10 +146,9 @@ export class VideoService {
     _spawnFFmpeg() {
         if (!this.active) return;
 
-        // Use gdigrab (built into ffmpeg for Windows) instead of the
-        // external "screen-capture-recorder" DirectShow filter, which is
-        // not installed by default and caused capture to fail.
-        const inputFormat = "gdigrab";
+        const hw = probeHardware(this.log);
+        const useDDAGrab = hw.ddagrab && process.platform === "win32";
+        const inputFormat = useDDAGrab ? "ddagrab" : "gdigrab";
         const inputArg = "desktop";
         const inputOpts = [];
         if (this.monitorWidth > 0 && this.monitorHeight > 0) {
@@ -123,24 +159,47 @@ export class VideoService {
 
         const bitrateKbps = this.currentBitrate;
         const maxrateKbps = Math.round(bitrateKbps * 1.2); // 20% headroom
-        const bufsizeKbps = bitrateKbps * 2;
+        // Low-latency: 0.4× duration, not 2× (10M → 2s VBV → 10-20ms queue)
+        const bufsizeKbps = Math.max(1500, Math.round(bitrateKbps * 0.4));
+
+        // Pick best encoder: NVENC > QSV > AMF > libx264
+        let codec = "libx264";
+        let preset = "ultrafast";
+        let tune = "zerolatency";
+        let extraCodecOpts = [];
+        if (hw.encoders.includes("h264_nvenc")) {
+            codec = "h264_nvenc"; preset = "llhp"; tune = "ull"; // NVIDIA low-latency HP + ultra-low
+            extraCodecOpts = ["-rc", "cbr", "-bf", "0", "-g", "60", "-forced-idr", "1"];
+        } else if (hw.encoders.includes("h264_qsv")) {
+            codec = "h264_qsv"; preset = "veryfast"; tune = "zerolatency";
+            extraCodecOpts = ["-bf", "0", "-g", "60"];
+        } else if (hw.encoders.includes("h264_amf")) {
+            codec = "h264_amf"; preset = "speed"; tune = "zerolatency";
+            extraCodecOpts = ["-bf", "0", "-g", "60"];
+        } else {
+            // libx264 fallback tightened
+            extraCodecOpts = ["-bf", "0", "-refs", "1", "-g", "60"];
+        }
+
+        const framerate = useDDAGrab ? "60" : "45";
+        const inputFramerate = framerate;
+        const gop = "60"; // 1s at 60fps or 1.3s at 45fps → faster IDR recovery
 
         const args = [
             "-f", inputFormat,
-            // Input options MUST precede -i: this sets how fast gdigrab polls
-            // the screen. Output framerate below then matches it.
-            "-framerate", "45",
+            // Input options MUST precede -i: this sets how fast capture polls
+            "-framerate", inputFramerate,
             ...inputOpts,
             "-i", inputArg,
             "-f", "mpegts",
-            "-codec:v", "libx264",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
+            "-codec:v", codec,
+            "-preset", preset,
+            "-tune", tune,
             "-b:v", `${bitrateKbps}k`,
             "-maxrate", `${maxrateKbps}k`,
             "-bufsize", `${bufsizeKbps}k`,
-            "-framerate", "45",
-            "-g", "90",
+            "-g", gop,
+            ...extraCodecOpts,
             "-pix_fmt", "yuv420p",
             "-fflags", "nobuffer+genpts",
             "-flags", "low_delay",
@@ -150,12 +209,19 @@ export class VideoService {
             "-start_at_zero",
             "pipe:1"
         ];
+        // ddagrab benefits from vsync/fps filter, but keep minimal
+        if (useDDAGrab) {
+            this.log(`[video] using DXGI ddagrab @${framerate}fps + ${codec} ${preset}/${tune}`);
+        }
 
         this.log(`[video] spawning ffmpeg: ${args.join(" ")}`);
 
         this.ffmpeg = spawn("ffmpeg", args, {
             stdio: ["ignore", "pipe", "pipe"]
         });
+        this._spawnTime = performance.now();
+        this._frameCount = 0;
+        latencyLog("capture_spawn", 0, `bitrate=${this.currentBitrate}`);
 
         this.ffmpeg.stdout.on("data", (chunk) => this._onVideoData(chunk));
         this.ffmpeg.stderr.on("data", (chunk) => {
@@ -200,10 +266,13 @@ export class VideoService {
 
     _onVideoData(chunk) {
         if (this.paused) return;
+        const now = performance.now();
         this._totalSent = (this._totalSent || 0) + chunk.length;
         if (!this._dataSeen) {
             this._dataSeen = true;
-            this.log(`[video] first stdout data (${chunk.length} bytes)`);
+            const firstMs = now - this._spawnTime;
+            this.log(`[video] first stdout data (${chunk.length} bytes) after ${firstMs.toFixed(1)}ms`);
+            latencyLog("capture_encode", firstMs, `first_chunk=${chunk.length}`);
         }
         if (this._totalSent - (this._lastLogged || 0) >= 1024 * 1024) {
             this._lastLogged = this._totalSent;
@@ -215,7 +284,10 @@ export class VideoService {
         while (this.buffer.length >= CHUNK_SIZE) {
             const frame = this.buffer.subarray(0, CHUNK_SIZE);
             this.buffer = this.buffer.subarray(CHUNK_SIZE);
+            const sendStart = performance.now();
             const ok = this.mux.send(CHANNELS.VIDEO, frame);
+            this._frameCount++;
+            latencyLog("network_send", performance.now() - sendStart, `frame=${this._frameCount},ok=${ok},buf=${this.mux.ws?.bufferedAmount||0}`);
             if (!ok && !this._sendDropped) {
                 this._sendDropped = true;
                 this.log(`[video] mux.send DROPPED (readyState=${this.mux.ws?.readyState}, buffered=${this.mux.ws?.bufferedAmount})`);
