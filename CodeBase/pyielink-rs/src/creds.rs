@@ -707,7 +707,7 @@ mod tests {
 
     #[test]
     fn json_round_trip() {
-        let mut state = HostState { enabled: true, users: BTreeMap::new() };
+        let mut state = HostState { enabled: true, users: BTreeMap::new(), ..Default::default() };
         state.users.insert(
             "bob".into(),
             UserRecord {
