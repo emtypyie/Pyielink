@@ -59,7 +59,7 @@ public static class PIKHook {
   const int WH_MOUSE_LL = 14, WH_KEYBOARD_LL = 13;
   const int WM_QUIT = 0x0012;
   const int WM_MOUSEMOVE = 0x200, WM_LBUTTONDOWN = 0x201, WM_LBUTTONUP = 0x202,
-            WM_RBUTTONDOWN = 0x204, WM_RBUTTONUP = 0x205, WM_MOUSEWHEEL = 0x20A;
+            WM_RBUTTONDOWN = 0x204, WM_RBUTTONUP = 0x205, WM_MBUTTONDOWN = 0x207, WM_MBUTTONUP = 0x208, WM_MOUSEWHEEL = 0x20A;
   const int WM_KEYDOWN = 0x100, WM_KEYUP = 0x101, WM_SYSKEYDOWN = 0x104, WM_SYSKEYUP = 0x105;
 
   // Must match inject.ps1's EXTRA_MAGIC. Events carrying this marker were
@@ -191,6 +191,8 @@ public static class PIKHook {
           case WM_LBUTTONUP:   SendMouse("lup",   info.pt.x, info.pt.y, 0); MouseSent++; return (IntPtr)1;
           case WM_RBUTTONDOWN: SendMouse("rdown", info.pt.x, info.pt.y, 0); MouseSent++; return (IntPtr)1;
           case WM_RBUTTONUP:   SendMouse("rup",   info.pt.x, info.pt.y, 0); MouseSent++; return (IntPtr)1;
+          case WM_MBUTTONDOWN: SendMouse("mdown", info.pt.x, info.pt.y, 0); MouseSent++; return (IntPtr)1;
+          case WM_MBUTTONUP:   SendMouse("mup",   info.pt.x, info.pt.y, 0); MouseSent++; return (IntPtr)1;
           case WM_MOUSEWHEEL: {
             short d = (short)((info.mouseData >> 16) & 0xFFFF);
             SendMouse("wheel", info.pt.x, info.pt.y, d);

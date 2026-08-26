@@ -115,8 +115,14 @@ function ensureViewer() {
     kind = "ffmpeg-sdl2";
   }
   proc.stdin.on("drain", () => {
-    if (activeWs && activeWs.readyState === WebSocket.OPEN) activeWs.resume();
+    try {
+      if (activeWs) {
+        if (activeWs._socket && activeWs._socket.resume) activeWs._socket.resume();
+        else if (activeWs.resume) activeWs.resume();
+      }
+    } catch {}
   });
+  proc.stdin.on("error", (e) => log(`viewer stdin error: ${e.message}`));
   proc.on("error", (e) => log(`viewer error (${kind}): ${e.message}`));
   proc.on("close", (code) => {
     log(`viewer (${kind}) exited (code ${code})`);
@@ -202,6 +208,65 @@ function startInputRelay(ws) {
   });
 }
 
+// ---- crosshair overlay (Option A: distinct double cursor) ------------------
+// Transparent WPF window over ffplay's client area. Red '+' follows mouse
+// instantly (local), host white arrow follows after latency in video.
+// Coords bottom-left, clicks sent via same CH_INPUT path. Falls back to
+// input_hook if crosshair.ps1 missing or WPF unavailable.
+let crosshairUdp = null;
+let crosshairHelper = null;
+
+function stopCrosshairRelay() {
+  if (crosshairHelper) {
+    try { process.kill(crosshairHelper.pid); } catch {}
+    try { spawn("taskkill", ["/PID", String(crosshairHelper.pid), "/T", "/F"], { stdio: "ignore" }).unref(); } catch {}
+    crosshairHelper = null;
+  }
+  if (crosshairUdp) {
+    try { crosshairUdp.close(); } catch {}
+    crosshairUdp = null;
+  }
+}
+
+function startCrosshairRelay(ws) {
+  stopCrosshairRelay();
+  stopInputRelay();
+  const ps1 = fileURLToPath(new URL("./assets/crosshair.ps1", import.meta.url));
+  if (!existsSync(ps1)) {
+    log("crosshair missing, falling back to hook");
+    return startInputRelay(ws);
+  }
+  const sock = dgram.createSocket("udp4");
+  sock.on("message", (buf) => {
+    const cur = activeWs;
+    if (cur && cur.readyState === WebSocket.OPEN) {
+      try { cur.send(frame(CH_INPUT, buf)); } catch {}
+    }
+  });
+  sock.on("error", (e) => log(`crosshair udp error: ${e.message}`));
+  sock.bind(0, "127.0.0.1", () => {
+    const port = sock.address().port;
+    const helper = spawn(
+      "powershell",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
+       "-ProcName", "ffplay", "-UdpPort", String(port),
+       "-Trace", process.env.TEMP + "\\pyielink-crosshair.log"],
+      { stdio: "ignore" }
+    );
+    crosshairHelper = helper;
+    crosshairUdp = sock;
+    log(`crosshair relay up (udp:${port}, pid:${helper.pid})`);
+    helper.on("exit", (c) => {
+      log(`crosshair helper exited (code ${c})`);
+      if (c !== 0) {
+        log("crosshair failed, falling back to hook");
+        stopCrosshairRelay();
+        startInputRelay(ws);
+      }
+    });
+  });
+}
+
 // ---- session ---------------------------------------------------------------
 let activeWs = null;
 let attempt = 0;
@@ -239,8 +304,17 @@ function connect() {
     if (channel === CH_VIDEO && viewer) {
       // Backpressure-aware pipe into the player: pause the socket while the
       // OS pipe is saturated instead of buffering without bound.
-      const ok = viewer.proc.stdin.write(payload);
-      if (!ok && ws.readyState === WebSocket.OPEN) ws.pause();
+      try {
+        const ok = viewer.proc.stdin.write(payload);
+        if (!ok && ws.readyState === WebSocket.OPEN) {
+          try {
+            if (ws._socket && ws._socket.pause) ws._socket.pause();
+            else if (ws.pause) ws.pause();
+          } catch {}
+        }
+      } catch (e) {
+        log(`viewer write error: ${e.message}`);
+      }
     }
   });
 
@@ -263,7 +337,11 @@ function connect() {
           )
         );
         ws.send(frame(CH_INPUT, JSON.stringify({ t: "input_start" })));
-        startInputRelay(ws);
+        // Option A: crosshair overlay (distinct red '+' vs white arrow in video)
+        // Fallback to legacy hook via --no-crosshair or if overlay missing.
+        const noCross = args.nocrosshair !== undefined || args["no-crosshair"] !== undefined || args.nocrosshair === "" || process.env.PYIELINK_NO_CROSSHAIR === "1";
+        if (noCross) startInputRelay(ws);
+        else startCrosshairRelay(ws);
       } else {
         log(`unexpected ack: ${ack.trim()}`);
         ws.close();
@@ -278,6 +356,7 @@ function connect() {
       log(`data layer closed (code ${code})`);
       try { ws.send(frame(CH_INPUT, JSON.stringify({ t: "input_stop" }))); } catch {}
       stopInputRelay();
+      stopCrosshairRelay();
     }
     scheduleReconnect(`closed ${code}`);
   });
@@ -290,9 +369,10 @@ function connect() {
 
 process.on("SIGINT", () => {
   stopInputRelay();
+  stopCrosshairRelay();
   process.exit(0);
 });
-process.on("exit", () => stopInputRelay());
+process.on("exit", () => { stopInputRelay(); stopCrosshairRelay(); });
 process.on("uncaughtException", (e) => log(`UNCAUGHT: ${e.stack || e}`));
 
 connect();

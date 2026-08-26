@@ -30,7 +30,7 @@ using System.Runtime.InteropServices;
 public class PIKIcon {
   public static IntPtr Found = IntPtr.Zero;
   public static IntPtr FindPlayerWindow(string procName) {
-    for (int i = 0; i < 80; i++) {
+    for (int i = 0; i < 240; i++) {
       Process[] ps = Process.GetProcessesByName(procName);
       foreach (Process p in ps) {
         try {
@@ -60,7 +60,7 @@ public class PIKIcon {
 Tr "types loaded"
 
 $hwnd = [PIKIcon]::FindPlayerWindow($ProcName)
-if ($hwnd -eq [IntPtr]::Zero) { Tr "no window found after 20s"; exit 1 }
+if ($hwnd -eq [IntPtr]::Zero) { Tr "no window found after 60s"; exit 1 }
 Tr "hwnd=$hwnd"
 
 if (-not (Test-Path $Image)) { Tr "image missing"; exit 1 }
