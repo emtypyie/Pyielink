@@ -11,9 +11,14 @@
 import { spawn } from "child_process";
 import process from "node:process";
 import dgram from "node:dgram";
-import { existsSync, openSync, writeSync, closeSync } from "node:fs";
+import { existsSync, openSync, writeSync, closeSync, appendFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { performance } from "node:perf_hooks";
+const LATENCY_CSV = (process.env.TEMP || ".") + "\\pyielink-latency.csv";
+function latencyLog(stage, ms, extra="") {
+  try { appendFileSync(LATENCY_CSV, `${Date.now()},${stage},${ms.toFixed(2)},${extra}\n`); } catch {}
+}
 
 const require = createRequire(import.meta.url);
 const WebSocket = require("ws");
@@ -94,6 +99,15 @@ function ensureViewer() {
   // possible without spamming the console.
   const ffLog = openSync(process.env.TEMP + "\\pyielink-ffplay.log", "a");
   try { writeSync(ffLog, `\n==== viewer spawn ${new Date().toISOString()} ====\n`); } catch {}
+  // Probe for hwaccel decode (DXVA2/D3D11VA/CUDA/VideoToolbox) — zero-copy if available
+  let hwaccelArgs = [];
+  try {
+    const cp = require("child_process");
+    const out = cp.execSync("ffmpeg -hide_banner -hwaccels 2>&1", { timeout: 2000 }).toString();
+    if (out.includes("d3d11va") || out.includes("dxva2") || out.includes("cuda") || out.includes("qsv") || out.includes("videotoolbox")) {
+      hwaccelArgs = ["-hwaccel", "auto"];
+    }
+  } catch {}
   const common = [
     // NOTE: all input options (and -window_title) MUST come before -i,
     // otherwise ffplay parses them as the input filename.
@@ -103,6 +117,7 @@ function ensureViewer() {
     "-window_title", "Pyielink - Remote Screen",
     "-loglevel", "error",
     "-nostats",
+    ...hwaccelArgs,
     "-i", "pipe:0",
   ];
   try {
@@ -302,10 +317,14 @@ function connect() {
       return;
     }
     if (channel === CH_VIDEO && viewer) {
+      const recvMs = performance.now();
+      latencyLog("network_recv", 0, `len=${payload.length}`);
       // Backpressure-aware pipe into the player: pause the socket while the
       // OS pipe is saturated instead of buffering without bound.
       try {
+        const w0 = performance.now();
         const ok = viewer.proc.stdin.write(payload);
+        latencyLog("decode_write", performance.now() - w0, `len=${payload.length},ok=${ok}`);
         if (!ok && ws.readyState === WebSocket.OPEN) {
           try {
             if (ws._socket && ws._socket.pause) ws._socket.pause();
@@ -315,6 +334,7 @@ function connect() {
       } catch (e) {
         log(`viewer write error: ${e.message}`);
       }
+      latencyLog("e2e_network_decode", performance.now() - recvMs, `len=${payload.length}`);
     }
   });
 

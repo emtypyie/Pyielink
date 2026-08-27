@@ -11,7 +11,7 @@ export const CHANNELS = Object.freeze({
 
 const HEADER = 5;
 const MAX_PAYLOAD = 8 * 1024 * 1024;
-export const HIGH_WATER = 4 * 1024 * 1024;
+export const HIGH_WATER = 256 * 1024; // 256K, not 4M: backpressure early, keep queue <15ms at 5Mbps
 
 export function frame(channel, payload) {
   const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
