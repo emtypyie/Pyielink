@@ -6,8 +6,21 @@ PYIELINK FRAMEWORK is a remote machine access framework with peer-to-peer connec
 
 ## Install
 
-- **npm:** `npm install -g pyielink`
-- **emtypyie.cli:** `/get pyielink` from https://emtypyie.in/cli — once installed it runs as `/pyielink` inside the CLI (the shell does not forward arguments)
+PYIELINK FRAMEWORK is distributed as the `pyielink` CLI. Requires **Node.js 18+** and `ffmpeg` / `ffplay` on `PATH`.
+
+### npm
+```sh
+npm install -g pyielink
+```
+
+### emtypyie.cli
+From https://emtypyie.in/cli, run:
+```
+/get pyielink
+```
+Once installed it runs as `/pyielink` inside the CLI (the shell does not forward arguments).
+
+After install, `pyielink` (or `/pyielink`) is on your `PATH` — see Commands below.
 
 ## Commands
 
