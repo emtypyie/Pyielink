@@ -1,6 +1,6 @@
 {
     "name":  "pyielink",
-    "version": "0.7.4",
+    "version": "0.7.5",
     "description":  "Pyielink Framework is a remote machine access protocol developed by Emtypyie",
     "main":  "cli.js",
     "bin":  {

@@ -268,7 +268,7 @@ fn handle_conn(mut stream: TcpStream) {
             return;
         }
     };
-    let ticket = format!("{}\n{}", dl_port, session_key);
+    let ticket = format!("{}\n{}", data_port_public(dl_port), session_key);
     if proto::write_frame(&mut stream, AUTH_OK, ticket.as_bytes()).is_ok() {
         println!(
             "  [ok] {} promoted as '{}' ({}, data port {}, terminal attached)",
@@ -460,6 +460,57 @@ fn pick_free_port() -> Option<u16> {
 /// Write the single-use handoff file ("<key>\n<user>\n<role>") and spawn the
 /// Node server with PYIELINK_SESSION pointing at it; the child deletes the
 /// file on startup so the key never lingers on disk.
+/// Shared tunnel handshake file written by `pyielink tunnel start` and read by
+/// the host so a roaming client can reach both the bootstrap and data ports.
+fn tunnel_info_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("pyielink-tunnel.txt")
+}
+
+fn read_tunnel_info() -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    if let Ok(text) = std::fs::read_to_string(tunnel_info_path()) {
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                map.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Data-layer listen port: explicit PYIELINK_DATA_PORT, else the port the
+/// tunnel forwarded (`data_local`), else a random free port.
+fn resolve_data_port() -> Option<u16> {
+    if let Ok(p) = std::env::var("PYIELINK_DATA_PORT") {
+        if let Ok(port) = p.parse::<u16>() {
+            return Some(port);
+        }
+    }
+    if let Some(v) = read_tunnel_info().get("data_local") {
+        if let Ok(port) = v.parse::<u16>() {
+            return Some(port);
+        }
+    }
+    pick_free_port()
+}
+
+/// Public address returned to the client for the data layer. When tunneling,
+/// this is the tunnel's public `data` address so the client reaches it through
+/// cloudflared instead of the host's unreachable LAN IP.
+fn data_port_public(local: u16) -> String {
+    if let Ok(p) = std::env::var("PYIELINK_DATA_PUBLIC") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    if let Some(v) = read_tunnel_info().get("data") {
+        if !v.is_empty() {
+            return v.clone();
+        }
+    }
+    local.to_string()
+}
+
 fn spawn_datalayer(
     session_key: &str,
     user: &str,
@@ -471,7 +522,7 @@ fn spawn_datalayer(
     }
     let script = datalayer_script()
         .ok_or_else(|| "data layer unavailable: datalayer/src/server.js not found".to_string())?;
-    let port = pick_free_port().ok_or_else(|| "no free local port for data layer".to_string())?;
+    let port = resolve_data_port().ok_or_else(|| "no free local port for data layer".to_string())?;
     let handoff = std::env::temp_dir().join(format!("pyielink-session-{}.env", crate::token::generate()));
     std::fs::write(&handoff, format!("{}\n{}\n{}\n", session_key, user, role))
         .map_err(|e| format!("cannot write session handoff: {}", e))?;

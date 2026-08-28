@@ -39,6 +39,22 @@ function resolveEncode(codec, presets, tunes, extra) {
     return cfg;
 }
 
+// Probe whether an ffmpeg capture input can actually open (e.g. ddagrab needs a
+// GPU + active Desktop Duplication session; on GPU-less / RDP / VM hosts it
+// fails and we must fall back to gdigrab).
+function ffmpegCaptureWorks(fmt, arg) {
+    try {
+        const r = spawnSync("ffmpeg", [
+            "-hide_banner", "-t", "0.3",
+            "-f", fmt, "-i", arg,
+            "-f", "null", "-"
+        ], { timeout: 8000, stdio: "ignore" });
+        return r.status === 0;
+    } catch (_) {
+        return false;
+    }
+}
+
 
 const CHUNK_SIZE = 1200; // MTU-friendly: 1200B < 1500 MTU, vs 64K bursty (NALU slicer)
 const FFMPEG_RESTART_DELAY = 2000;
@@ -206,8 +222,17 @@ export class VideoService {
 
         const hw = probeHardware(this.log);
         const cap = pickCapture(hw);
-        const inputFormat = cap.fmt;
+        let inputFormat = cap.fmt;
         let inputArg = cap.arg;
+        // ddagrab (ffmpeg's DXGI Desktop Duplication) needs a GPU + active
+        // Desktop Duplication session — unavailable on GPU-less / RDP / VM hosts.
+        // Probe it; if it fails, fall back to gdigrab (CPU/GDI), which works
+        // without a GPU as long as a desktop session exists.
+        if (inputFormat === "ddagrab" && !ffmpegCaptureWorks("ddagrab", inputArg)) {
+            this.log("[video] ddagrab unavailable (no DXGI/Desktop Duplication) — using gdigrab");
+            inputFormat = "gdigrab";
+            inputArg = "desktop";
+        }
         const framerate = cap.fr;
         const inputOpts = [];
         if (this.monitorWidth > 0 && this.monitorHeight > 0) {
@@ -277,10 +302,17 @@ export class VideoService {
         // GPU. The C++ helper (assets/dxgi_capture.exe) grabs frames and
         // pipes raw BGRA to ffmpeg, which only encodes (NVENC/QSV/...).
         const dxgiExe = path.join(ASSETS, "dxgi_capture.exe");
+        if (this.dxgiForcedOff === undefined) this.dxgiForcedOff = false;
         let useDxgi = false;
-        if (process.env.PYIELINK_CAPTURE === "dxgi") useDxgi = true;
-        else if (process.env.PYIELINK_CAPTURE === "gdigrab") useDxgi = false;
-        else useDxgi = existsSync(dxgiExe);
+        if (this.dxgiForcedOff) {
+            this.log("[video] DXGI disabled after previous failure; using gdigrab");
+        } else if (process.env.PYIELINK_CAPTURE === "dxgi") {
+            useDxgi = true;
+        } else if (process.env.PYIELINK_CAPTURE === "gdigrab") {
+            useDxgi = false;
+        } else {
+            useDxgi = existsSync(dxgiExe);
+        }
         let dxgiW = 0, dxgiH = 0;
         if (useDxgi) {
             try {
@@ -289,9 +321,9 @@ export class VideoService {
                 if (mw && mh) { dxgiW = parseInt(mw[1], 10); dxgiH = parseInt(mh[1], 10); }
             } catch (e) {
                 this.log(`[video] dxgi probe failed (${e.message}); falling back to ${inputFormat}`);
-                useDxgi = false;
+                useDxgi = false; this.dxgiForcedOff = true;
             }
-            if (dxgiW < 1 || dxgiH < 1) useDxgi = false;
+            if (dxgiW < 1 || dxgiH < 1) { useDxgi = false; this.dxgiForcedOff = true; }
         }
 
         let args;
@@ -323,7 +355,13 @@ export class VideoService {
             this.cap = spawn(dxgiExe, ["0"], { stdio: ["ignore", "pipe", "pipe"] });
             this.cap.stderr.on("data", (d) => { const m = d.toString().trim(); if (m) this.log(`[video] dxgi: ${m}`); });
             this.cap.on("error", (e) => this.log(`[video] dxgi spawn error: ${e.message}`));
-            this.cap.on("close", (code) => { if (this.active) this._scheduleRestart(); });
+            this.cap.on("close", (code) => {
+                if (code !== 0) {
+                    this.dxgiForcedOff = true;
+                    this.log(`[video] dxgi helper exited (code ${code}); falling back to gdigrab`);
+                }
+                if (this.active) this._scheduleRestart();
+            });
         } else {
             args = [
                 "-f", inputFormat,

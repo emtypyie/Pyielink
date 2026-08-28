@@ -208,6 +208,20 @@ pub fn parse_target(arg: &str) -> Result<(String, String), String> {
     Ok((user.to_string(), ip.to_string()))
 }
 
+/// Split `host` or `host:port` into (host, optional port). IPv6 (containing
+/// ':') without a trailing `:digits` is treated as a bare host.
+fn split_host_port(s: &str) -> (String, Option<u16>) {
+    if let Some(idx) = s.rfind(':') {
+        let (h, p) = s.split_at(idx);
+        if !p[1..].is_empty() && p[1..].chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(port) = p[1..].parse::<u16>() {
+                return (h.to_string(), Some(port));
+            }
+        }
+    }
+    (s.to_string(), None)
+}
+
 fn prompt_password() -> String {
     print!("password: ");
     let _ = std::io::stdout().flush();
@@ -231,11 +245,11 @@ fn authenticate(
     target: &str,
 ) -> Result<(String, String, SessionState, String, std::net::TcpStream), String> {
     let (user, ip) = parse_target(target)?;
-    let port: u16 = std::env::var("PYIELINK_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
+    let (host, target_port) = split_host_port(&ip);
+    let port: u16 = target_port
+        .or_else(|| std::env::var("PYIELINK_PORT").ok().and_then(|p| p.parse().ok()))
         .unwrap_or(BOOTSTRAP_PORT);
-    let addr = format!("{}:{}", ip, port);
+    let addr = format!("{}:{}", host, port);
 
     let mut stream = TcpStream::connect(&addr)
         .map_err(|e| format!("cannot reach {} — is the host running /enable? ({})", addr, e))?;
@@ -402,7 +416,7 @@ fn authenticate(
 
         // Initialize or update session state
         if session_state.is_none() {
-            session_state = Some(SessionState::new(user.clone(), ip.clone(), session_key.clone(), data_port.clone()));
+            session_state = Some(SessionState::new(user.clone(), host.clone(), session_key.clone(), data_port.clone()));
         } else {
             session_state.as_mut().unwrap().session_key = session_key.clone();
             session_state.as_mut().unwrap().data_port = data_port.clone();
@@ -831,7 +845,13 @@ fn data_link_connect(
 ) -> DlLinkResult {
     let dl_host = std::env::var("PYIELINK_DL_HOST").unwrap_or_else(|_| ip.to_string());
     let dl_port = std::env::var("PYIELINK_DL_PORT").unwrap_or_else(|_| port.to_string());
-    let addr = format!("{}:{}", dl_host, dl_port);
+    // A tunnel may return a full public address (host:port) as the data port;
+    // connect to it directly instead of <dl_host>:<dl_port>.
+    let addr = if dl_port.contains(':') {
+        dl_port.clone()
+    } else {
+        format!("{}:{}", dl_host, dl_port)
+    };
     let tcp = match TcpStream::connect(&addr) {
         Ok(s) => s,
         Err(e) => {
