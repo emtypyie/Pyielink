@@ -9,6 +9,7 @@
     "start": "node src/server.js --port 4243"
   },
   "dependencies": {
-    "ws": "8.18.0"
+    "ws": "8.18.0",
+    "werift": "0.24.4"
   }
 }

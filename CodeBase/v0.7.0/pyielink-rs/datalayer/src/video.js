@@ -1,12 +1,49 @@
 import { CHANNELS } from "./mux.js";
-import { spawn, execSync } from "child_process";
+import { spawn, execSync, spawnSync } from "child_process";
 import { performance } from "node:perf_hooks";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const ASSETS = fileURLToPath(new URL("./assets/", import.meta.url));
+
+// ffmpeg/nvenc preset names changed between builds: old "llhp"/"ll"/"hp" were
+// replaced by the p1..p7 presets in current ffmpeg. Probe a 1-frame lavfi
+// encode to pick a preset/tune combo this build actually accepts (cached).
+const encodeCache = {};
+function _encodeWorks(codec, preset, tune) {
+    try {
+        const r = spawnSync("ffmpeg", [
+            "-hide_banner", "-t", "1",
+            "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30",
+            "-c:v", codec, "-preset", preset, "-tune", tune, "-f", "null", "-"
+        ], { timeout: 20000, stdio: "ignore" });
+        return r.status === 0;
+    } catch (_) {
+        return false;
+    }
+}
+function resolveEncode(codec, presets, tunes, extra) {
+    if (encodeCache[codec]) return encodeCache[codec];
+    for (const p of presets) {
+        for (const t of tunes) {
+            if (_encodeWorks(codec, p, t)) {
+                const cfg = { codec, preset: p, tune: t, extra };
+                encodeCache[codec] = cfg;
+                return cfg;
+            }
+        }
+    }
+    const cfg = { codec, preset: presets[0], tune: tunes[0], extra };
+    encodeCache[codec] = cfg;
+    return cfg;
+}
+
 
 const CHUNK_SIZE = 1200; // MTU-friendly: 1200B < 1500 MTU, vs 64K bursty (NALU slicer)
 const FFMPEG_RESTART_DELAY = 2000;
 const MAX_RESTARTS = 5;
-const LATENCY_CSV = (process.env.TEMP || ".") + "\\pyielink-latency.csv";
+const LATENCY_CSV = path.join(process.env.TEMP || process.env.TMPDIR || ".", "pyielink-latency.csv");
 function latencyLog(stage, ms, extra="") {
   try {
     const line = `${Date.now()},${stage},${ms.toFixed(2)},${extra}\n`;
@@ -16,7 +53,8 @@ function latencyLog(stage, ms, extra="") {
 let hwProbeCache = null;
 function probeHardware(log) {
   if (hwProbeCache) return hwProbeCache;
-  const res = { ddagrab: false, encoders: [], hwaccels: [] };
+  const res = { ddagrab: false, encoders: [], hwaccels: [], captures: [] };
+  const CAPS = ["ddagrab", "gdigrab", "pipewire", "x11grab", "avfoundation"];
   try {
     const enc = execSync("ffmpeg -hide_banner -encoders 2>&1", { timeout: 3000 }).toString();
     if (enc.includes("h264_nvenc")) res.encoders.push("h264_nvenc");
@@ -29,14 +67,33 @@ function probeHardware(log) {
     res.hwaccels = hw.split(/\W+/).filter(Boolean);
   } catch {}
   try {
-    const fmts = execSync("ffmpeg -hide_banner -formats 2>&1", { timeout: 3000 }).toString();
-    if (fmts.includes("ddagrab")) res.ddagrab = true;
+    const devs = execSync("ffmpeg -hide_banner -devices 2>&1", { timeout: 3000 }).toString();
+    for (const c of CAPS) if (devs.includes(c)) res.captures.push(c);
+    res.ddagrab = res.captures.includes("ddagrab");
   } catch {}
-  // Also check gdigrab always available on Windows
   hwProbeCache = res;
-  try { log(`[video] hw probe: ddagrab=${res.ddagrab} encoders=[${res.encoders.join(",")}] hwaccels=[${res.hwaccels.join(",")}]`); } catch {}
-  latencyLog("hw_probe", 0, `ddagrab=${res.ddagrab},enc=${res.encoders.join("|")}`);
+  try { log(`[video] hw probe: captures=[${res.captures.join(",")}] encoders=[${res.encoders.join(",")}] hwaccels=[${res.hwaccels.join(",")}]`); } catch {}
+  latencyLog("hw_probe", 0, `caps=${res.captures.join("|")},enc=${res.encoders.join("|")}`);
   return res;
+}
+
+// Choose the best screen-capture input for the current OS, based on what ffmpeg
+// supports here. Cross-platform: Windows ddagrab/gdigrab, Linux pipewire/x11grab,
+// macOS avfoundation.
+function pickCapture(hw) {
+  const p = process.platform;
+  if (p === "win32") {
+    if (hw.captures.includes("ddagrab")) return { fmt: "ddagrab", arg: "desktop", fr: "60" };
+    return { fmt: "gdigrab", arg: "desktop", fr: "60" };
+  }
+  if (p === "linux") {
+    if (hw.captures.includes("pipewire")) return { fmt: "pipewire", arg: "desktop", fr: "60" };
+    return { fmt: "x11grab", arg: ":0.0", fr: "60" };
+  }
+  if (p === "darwin") {
+    return { fmt: "avfoundation", arg: "1:none", fr: "60" };
+  }
+  return { fmt: "gdigrab", arg: "desktop", fr: "60" };
 }
 
 export class VideoService {
@@ -46,6 +103,7 @@ export class VideoService {
         this.log = log || (() => {});
         this.active = false;
         this.ffmpeg = null;
+        this.cap = null; // DXGI capture helper (when used instead of gdigrab)
         this.restartCount = 0;
         this.restartTimer = null;
         this.buffer = Buffer.alloc(0);
@@ -147,14 +205,23 @@ export class VideoService {
         if (!this.active) return;
 
         const hw = probeHardware(this.log);
-        const useDDAGrab = hw.ddagrab && process.platform === "win32";
-        const inputFormat = useDDAGrab ? "ddagrab" : "gdigrab";
-        const inputArg = "desktop";
+        const cap = pickCapture(hw);
+        const inputFormat = cap.fmt;
+        let inputArg = cap.arg;
+        const framerate = cap.fr;
         const inputOpts = [];
         if (this.monitorWidth > 0 && this.monitorHeight > 0) {
-            inputOpts.push("-offset_x", String(this.monitorOffsetX));
-            inputOpts.push("-offset_y", String(this.monitorOffsetY));
-            inputOpts.push("-video_size", `${this.monitorWidth}x${this.monitorHeight}`);
+            if (inputFormat === "x11grab") {
+                inputArg = `:0.0+${this.monitorOffsetX},${this.monitorOffsetY}`;
+                inputOpts.push("-video_size", `${this.monitorWidth}x${this.monitorHeight}`);
+            } else if (inputFormat === "avfoundation") {
+                inputOpts.push("-capture_cursor", "0");
+                inputOpts.push("-video_size", `${this.monitorWidth}x${this.monitorHeight}`);
+            } else {
+                inputOpts.push("-offset_x", String(this.monitorOffsetX));
+                inputOpts.push("-offset_y", String(this.monitorOffsetY));
+                inputOpts.push("-video_size", `${this.monitorWidth}x${this.monitorHeight}`);
+            }
         }
 
         const bitrateKbps = this.currentBitrate;
@@ -163,62 +230,138 @@ export class VideoService {
         const bufsizeKbps = Math.max(1500, Math.round(bitrateKbps * 0.4));
 
         // Pick best encoder: NVENC > QSV > AMF > libx264
+        // Preset/tune are auto-detected per ffmpeg build (see resolveEncode).
         let codec = "libx264";
         let preset = "ultrafast";
         let tune = "zerolatency";
         let extraCodecOpts = [];
         if (hw.encoders.includes("h264_nvenc")) {
-            codec = "h264_nvenc"; preset = "llhp"; tune = "ull"; // NVIDIA low-latency HP + ultra-low
-            extraCodecOpts = ["-rc", "cbr", "-bf", "0", "-g", "60", "-forced-idr", "1"];
+            const e = resolveEncode("h264_nvenc",
+                ["p1", "llhp", "ll", "hp", "fast"],
+                ["ull", "zerolatency", "ll"],
+                ["-rc", "cbr", "-bf", "0", "-g", "60", "-forced-idr", "1"]);
+            codec = e.codec; preset = e.preset; tune = e.tune; extraCodecOpts = e.extra;
         } else if (hw.encoders.includes("h264_qsv")) {
-            codec = "h264_qsv"; preset = "veryfast"; tune = "zerolatency";
-            extraCodecOpts = ["-bf", "0", "-g", "60"];
+            const e = resolveEncode("h264_qsv",
+                ["veryfast", "fast", "medium"],
+                ["zerolatency", "ull"],
+                ["-bf", "0", "-g", "60"]);
+            codec = e.codec; preset = e.preset; tune = e.tune; extraCodecOpts = e.extra;
         } else if (hw.encoders.includes("h264_amf")) {
-            codec = "h264_amf"; preset = "speed"; tune = "zerolatency";
-            extraCodecOpts = ["-bf", "0", "-g", "60"];
+            const e = resolveEncode("h264_amf",
+                ["speed", "fast"],
+                ["zerolatency", "ull"],
+                ["-bf", "0", "-g", "60"]);
+            codec = e.codec; preset = e.preset; tune = e.tune; extraCodecOpts = e.extra;
         } else {
             // libx264 fallback tightened
             extraCodecOpts = ["-bf", "0", "-refs", "1", "-g", "60"];
         }
 
-        const framerate = useDDAGrab ? "60" : "45";
         const inputFramerate = framerate;
         const gop = "60"; // 1s at 60fps or 1.3s at 45fps → faster IDR recovery
 
-        const args = [
-            "-f", inputFormat,
-            // Input options MUST precede -i: this sets how fast capture polls
-            "-framerate", inputFramerate,
-            ...inputOpts,
-            "-i", inputArg,
-            "-f", "mpegts",
-            "-codec:v", codec,
-            "-preset", preset,
-            "-tune", tune,
-            "-b:v", `${bitrateKbps}k`,
-            "-maxrate", `${maxrateKbps}k`,
-            "-bufsize", `${bufsizeKbps}k`,
-            "-g", gop,
-            ...extraCodecOpts,
-            "-pix_fmt", "yuv420p",
-            "-fflags", "nobuffer+genpts",
-            "-flags", "low_delay",
-            "-probesize", "32",
-            "-analyzeduration", "0",
-            "-copyts",
-            "-start_at_zero",
-            "pipe:1"
-        ];
-        // ddagrab benefits from vsync/fps filter, but keep minimal
-        if (useDDAGrab) {
-            this.log(`[video] using DXGI ddagrab @${framerate}fps + ${codec} ${preset}/${tune}`);
+        // Optional downscale: trade resolution for encode/decode headroom so
+        // weaker clients (or single-box test setups) can still sustain 60fps.
+        // PYIELINK_VIDEO_SCALE=1280:720  (WxH or W:H; aspect preserved)
+        const outPre = [];
+        const scaleEnv = process.env.PYIELINK_VIDEO_SCALE;
+        if (scaleEnv && !this.monitorWidth) {
+            const m = String(scaleEnv).match(/(\d+)[x:](\d+)/);
+            if (m) outPre.push("-vf", `scale=${m[1]}:${m[2]}:force_original_aspect_ratio=decrease`);
+        }
+
+        // --- GPU Desktop Duplication capture (DXGI) when available ---
+        // gdigrab (GDI BitBlt) tops out ~30-45 fps on a single box; DXGI
+        // Desktop Duplication runs at the display refresh (60/120/144) on the
+        // GPU. The C++ helper (assets/dxgi_capture.exe) grabs frames and
+        // pipes raw BGRA to ffmpeg, which only encodes (NVENC/QSV/...).
+        const dxgiExe = path.join(ASSETS, "dxgi_capture.exe");
+        let useDxgi = false;
+        if (process.env.PYIELINK_CAPTURE === "dxgi") useDxgi = true;
+        else if (process.env.PYIELINK_CAPTURE === "gdigrab") useDxgi = false;
+        else useDxgi = existsSync(dxgiExe);
+        let dxgiW = 0, dxgiH = 0;
+        if (useDxgi) {
+            try {
+                const probe = execSync(`"${dxgiExe}" 0 --probe`, { timeout: 8000 }).toString();
+                const mw = probe.match(/WIDTH=(\d+)/), mh = probe.match(/HEIGHT=(\d+)/);
+                if (mw && mh) { dxgiW = parseInt(mw[1], 10); dxgiH = parseInt(mh[1], 10); }
+            } catch (e) {
+                this.log(`[video] dxgi probe failed (${e.message}); falling back to ${inputFormat}`);
+                useDxgi = false;
+            }
+            if (dxgiW < 1 || dxgiH < 1) useDxgi = false;
+        }
+
+        let args;
+        if (useDxgi) {
+            args = [
+                "-f", "rawvideo",
+                "-pix_fmt", "bgra",
+                "-s", `${dxgiW}x${dxgiH}`,
+                "-r", "60",
+                "-i", "pipe:0",
+                ...outPre,
+                "-f", "mpegts",
+                "-codec:v", codec,
+                "-preset", preset,
+                "-tune", tune,
+                "-b:v", `${bitrateKbps}k`,
+                "-maxrate", `${maxrateKbps}k`,
+                "-bufsize", `${bufsizeKbps}k`,
+                "-g", gop,
+                ...extraCodecOpts,
+                "-pix_fmt", "yuv420p",
+                "-fflags", "nobuffer+genpts",
+                "-flags", "low_delay",
+                "-probesize", "32",
+                "-analyzeduration", "0",
+                "pipe:1"
+            ];
+            this.log(`[video] using DXGI Desktop Duplication ${dxgiW}x${dxgiH} @60fps + ${codec} ${preset}/${tune}${outPre.length ? " + scale=" + scaleEnv : ""}`);
+            this.cap = spawn(dxgiExe, ["0"], { stdio: ["ignore", "pipe", "pipe"] });
+            this.cap.stderr.on("data", (d) => { const m = d.toString().trim(); if (m) this.log(`[video] dxgi: ${m}`); });
+            this.cap.on("error", (e) => this.log(`[video] dxgi spawn error: ${e.message}`));
+            this.cap.on("close", (code) => { if (this.active) this._scheduleRestart(); });
+        } else {
+            args = [
+                "-f", inputFormat,
+                // Input options MUST precede -i: this sets how fast capture polls
+                "-framerate", inputFramerate,
+                ...inputOpts,
+                "-i", inputArg,
+                ...outPre,
+                "-f", "mpegts",
+                "-codec:v", codec,
+                "-preset", preset,
+                "-tune", tune,
+                "-b:v", `${bitrateKbps}k`,
+                "-maxrate", `${maxrateKbps}k`,
+                "-bufsize", `${bufsizeKbps}k`,
+                "-g", gop,
+                ...extraCodecOpts,
+                "-pix_fmt", "yuv420p",
+                "-fflags", "nobuffer+genpts",
+                "-flags", "low_delay",
+                "-probesize", "32",
+                "-analyzeduration", "0",
+                "-copyts",
+                "-start_at_zero",
+                "pipe:1"
+            ];
+            this.log(`[video] using ${inputFormat} @${framerate}fps + ${codec} ${preset}/${tune}${outPre.length ? " + scale=" + scaleEnv : ""}`);
         }
 
         this.log(`[video] spawning ffmpeg: ${args.join(" ")}`);
 
         this.ffmpeg = spawn("ffmpeg", args, {
-            stdio: ["ignore", "pipe", "pipe"]
+            stdio: useDxgi ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"]
         });
+        if (useDxgi && this.cap) {
+            // Helper raw BGRA stdout -> ffmpeg rawvideo stdin.
+            this.cap.stdout.pipe(this.ffmpeg.stdin);
+        }
         this._spawnTime = performance.now();
         this._frameCount = 0;
         latencyLog("capture_spawn", 0, `bitrate=${this.currentBitrate}`);
@@ -241,6 +384,10 @@ export class VideoService {
     }
 
     _killFFmpeg() {
+        if (this.cap && !this.cap.killed) {
+            try { this.cap.kill("SIGKILL"); } catch (_) {}
+        }
+        this.cap = null;
         if (this.ffmpeg && !this.ffmpeg.killed) {
             this.ffmpeg.kill("SIGTERM");
             setTimeout(() => {
@@ -281,17 +428,26 @@ export class VideoService {
 
         this.buffer = Buffer.concat([this.buffer, chunk]);
 
-        while (this.buffer.length >= CHUNK_SIZE) {
-            const frame = this.buffer.subarray(0, CHUNK_SIZE);
-            this.buffer = this.buffer.subarray(CHUNK_SIZE);
-            const sendStart = performance.now();
-            const ok = this.mux.send(CHANNELS.VIDEO, frame);
-            this._frameCount++;
-            latencyLog("network_send", performance.now() - sendStart, `frame=${this._frameCount},ok=${ok},buf=${this.mux.ws?.bufferedAmount||0}`);
-            if (!ok && !this._sendDropped) {
-                this._sendDropped = true;
-                this.log(`[video] mux.send DROPPED (readyState=${this.mux.ws?.readyState}, buffered=${this.mux.ws?.bufferedAmount})`);
+        // Drain in MTU-sized frames. If a send fails (DC closed mid-frame,
+        // backpressure, network drop) we just drop that frame and keep going
+        // with the next one — never let a transient error kill the encoder.
+        try {
+            while (this.buffer.length >= CHUNK_SIZE) {
+                const frame = this.buffer.subarray(0, CHUNK_SIZE);
+                this.buffer = this.buffer.subarray(CHUNK_SIZE);
+                const sendStart = performance.now();
+                const ok = this.mux.send(CHANNELS.VIDEO, frame);
+                this._frameCount++;
+                latencyLog("network_send", performance.now() - sendStart, `frame=${this._frameCount},ok=${ok},buf=${this.mux.ws?.bufferedAmount||0}`);
+                if (!ok && !this._sendDropped) {
+                    this._sendDropped = true;
+                    this.log(`[video] mux.send DROPPED (readyState=${this.mux.ws?.readyState}, buffered=${this.mux.ws?.bufferedAmount})`);
+                } else if (ok) {
+                    this._sendDropped = false;
+                }
             }
+        } catch (e) {
+            this.log(`[video] send loop error (dropping frame, continuing): ${e.message}`);
         }
     }
 }

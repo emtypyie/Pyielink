@@ -9,9 +9,40 @@
 import { CHANNELS } from "./mux.js";
 import { spawn } from "child_process";
 import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import path from "node:path";
+import { fileURLToPath, URL } from "node:url";
 
-const INJECTOR = fileURLToPath(new URL("./assets/inject.ps1", import.meta.url));
+const ASSETS = fileURLToPath(new URL("./assets/", import.meta.url));
+
+// Per-platform injector scripts. All speak the SAME JSON-line protocol on stdin
+// (see assets/inject.ps1 for the schema) so InputService just writes lines.
+function injectorForPlatform() {
+  switch (process.platform) {
+    case "win32":
+      return {
+        label: "windows(SendInput)",
+        script: path.join(ASSETS, "inject.ps1"),
+        cmd: "powershell",
+        args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(ASSETS, "inject.ps1")],
+      };
+    case "linux":
+      return {
+        label: "linux(xdotool)",
+        script: path.join(ASSETS, "inject_linux.js"),
+        cmd: "node",
+        args: [path.join(ASSETS, "inject_linux.js")],
+      };
+    case "darwin":
+      return {
+        label: "macos(cliclick)",
+        script: path.join(ASSETS, "inject_mac.js"),
+        cmd: "node",
+        args: [path.join(ASSETS, "inject_mac.js")],
+      };
+    default:
+      return null;
+  }
+}
 
 export class InputService {
     constructor(mux, session, log) {
@@ -64,22 +95,23 @@ export class InputService {
 
     start() {
         if (this.active) return;
-        if (!existsSync(INJECTOR)) {
-            this.log(`[input] injector missing: ${INJECTOR}`);
+        const pick = injectorForPlatform();
+        if (!pick) {
+            this.log(`[input] no injector for platform ${process.platform}`);
             return;
         }
-        this.injector = spawn(
-            "powershell",
-            ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", INJECTOR],
-            { stdio: ["pipe", "ignore", "pipe"] }
-        );
+        if (!existsSync(pick.script)) {
+            this.log(`[input] injector missing: ${pick.script} (install ${pick.label})`);
+            return;
+        }
+        this.injector = spawn(pick.cmd, pick.args, { stdio: ["pipe", "ignore", "pipe"] });
         this.injector.stderr.on("data", (d) => {
             const s = d.toString().trim();
             if (s) this.log(`[input] injector: ${s}`);
         });
         this.injector.on("exit", () => { this.injector = null; });
         this.active = true;
-        this.log("[input] capture started");
+        this.log(`[input] capture started (${pick.label})`);
     }
 
     stop() {

@@ -54,7 +54,8 @@ public static class PIKHook {
   [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr w, out RECT r);
   [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr w, ref POINT p);
-  [DllImport("user32.dll")] static extern bool IsWindow(IntPtr w);
+   [DllImport("user32.dll")] static extern bool IsWindow(IntPtr w);
+   [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
 
   const int WH_MOUSE_LL = 14, WH_KEYBOARD_LL = 13;
   const int WM_QUIT = 0x0012;
@@ -137,17 +138,23 @@ public static class PIKHook {
     return false;
   }
 
-  // True when the cursor is over the target's CLIENT area and it is focused.
-  static bool Capturing(POINT pt) {
-    if (target == IntPtr.Zero || !IsWindow(target)) return false;
-    if (GetForegroundWindow() != target) return false;
-    RECT r;
-    if (!GetClientRect(target, out r)) return false;
-    POINT o; o.x = 0; o.y = 0;
-    if (!ClientToScreen(target, ref o)) return false;
-    return pt.x >= o.x && pt.x < o.x + (r.R - r.L) &&
-           pt.y >= o.y && pt.y < o.y + (r.B - r.T);
-  }
+   // True when the cursor is over the target's visible CLIENT area. We no
+   // longer require the viewer to be the FOREGROUND window - only that it is
+   // the topmost window under the cursor (WindowFromPoint) - so simply
+   // hovering the viewer captures input. This is the expected RDP feel; the
+   // old foreground-only gate made the remote cursor appear "stuck".
+   static bool Capturing(POINT pt) {
+     if (target == IntPtr.Zero || !IsWindow(target)) return false;
+     RECT r;
+     if (!GetClientRect(target, out r)) return false;
+     POINT o; o.x = 0; o.y = 0;
+     if (!ClientToScreen(target, ref o)) return false;
+     if (!(pt.x >= o.x && pt.x < o.x + (r.R - r.L) &&
+           pt.y >= o.y && pt.y < o.y + (r.B - r.T))) return false;
+     // Only capture if the viewer is actually the topmost window at the
+     // cursor (not occluded); otherwise let the occluding window receive it.
+     return WindowFromPoint(pt) == target;
+   }
 
   static void SendJson(string s) {
     byte[] b = Encoding.UTF8.GetBytes(s);

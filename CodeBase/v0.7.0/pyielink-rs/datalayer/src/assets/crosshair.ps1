@@ -230,24 +230,25 @@ $timer.Add_Tick({
   if(-not [PIKOver]::ClientToScreen($hwndRef,[ref]$o)){return}
   $cw=$r.R-$r.L; $ch=$r.B-$r.T
   if($cw -lt 1 -or $ch -lt 1){return}
-  # DPI scaling
-  $dpi=[PIKOver]::GetDpiForWindow($hwndRef); if($dpi -eq 0){$dpi=96}
-  $scale=$dpi/96.0
-  # Hide when minimized or not foreground (user switched away) — prevents ghost over other apps
-  $isMin=[PIKOver]::IsIconic($hwndRef)
-  $fg=[PIKOver]::GetForegroundWindow()
-  $foreOk=($fg -eq $hwndRef -or $fg -eq $hwndOver)
-  if($isMin -or -not $foreOk){
-    if($win.Visibility -ne [System.Windows.Visibility]::Hidden){
-      $win.Visibility=[System.Windows.Visibility]::Hidden
-      $hLine.Visibility=[System.Windows.Visibility]::Hidden
-      $vLine.Visibility=[System.Windows.Visibility]::Hidden
-      $dot.Visibility=[System.Windows.Visibility]::Hidden
-    }
-    return
-  } else {
-    if($win.Visibility -ne [System.Windows.Visibility]::Visible){ $win.Visibility=[System.Windows.Visibility]::Visible }
-  }
+   # DPI scaling
+   $dpi=[PIKOver]::GetDpiForWindow($hwndRef); if($dpi -eq 0){$dpi=96}
+   $scale=$dpi/96.0
+   # Hide only when minimized or the target window is gone. We deliberately do
+   # NOT require ffplay to be the foreground window: hovering the viewer is
+   # enough to capture (RDP-like). Requiring foreground made the remote cursor
+   # appear "stuck" because hovering never focuses the window.
+   $isMin=[PIKOver]::IsIconic($hwndRef)
+   if($isMin){
+     if($win.Visibility -ne [System.Windows.Visibility]::Hidden){
+       $win.Visibility=[System.Windows.Visibility]::Hidden
+       $hLine.Visibility=[System.Windows.Visibility]::Hidden
+       $vLine.Visibility=[System.Windows.Visibility]::Hidden
+       $dot.Visibility=[System.Windows.Visibility]::Hidden
+     }
+     return
+   } else {
+     if($win.Visibility -ne [System.Windows.Visibility]::Visible){ $win.Visibility=[System.Windows.Visibility]::Visible }
+   }
   $win.Left=$o.x/$scale
   $win.Top=$o.y/$scale
   $win.Width=$cw/$scale

@@ -4,3 +4,22 @@ CodeBase/**/target/
 _*.log
 PHASES.md
 *.txt
+
+# ---- test artifacts (never commit) ----
+test-*.ps1
+test_*.ps1
+*_test.ps1
+*test*.ps1
+e2e/
+run_test.ps1
+final_test.ps1
+stim_test.ps1
+wiggle.exe
+wiggle.cpp
+pyielink-*-pack.zip
+build_output.txt
+
+# ---- deps / build output ----
+node_modules/
+**/node_modules/
+*.log

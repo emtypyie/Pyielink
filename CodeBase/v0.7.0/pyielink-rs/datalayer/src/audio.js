@@ -54,10 +54,22 @@ export class AudioService {
     _spawnFFmpeg() {
         if (!this.active) return;
 
+        // Cross-platform capture source. Encoding (opus) is platform-independent.
+        let inputArgs;
+        if (process.platform === "win32") {
+            inputArgs = ["-f", "dshow", "-i", "audio=Microphone"];
+        } else if (process.platform === "darwin") {
+            inputArgs = ["-f", "avfoundation", "-i", ":default"];
+        } else {
+            // Linux: prefer PulseAudio (also exposed by pipewire-pulse); fall
+            // back to ALSA if Pulse is absent.
+            inputArgs = process.env.PYIELINK_AUDIO_SRC
+                ? ["-f", process.env.PYIELINK_AUDIO_SRC.split(":")[0], "-i", process.env.PYIELINK_AUDIO_SRC.split(":")[1] || "default"]
+                : ["-f", "pulse", "-i", "default"];
+        }
 
         const args = [
-            "-f", "dshow",
-            "-i", "audio=Microphone",
+            ...inputArgs,
             "-c:a", "libopus",
             "-b:a", "64k",
             "-application", "voip",
