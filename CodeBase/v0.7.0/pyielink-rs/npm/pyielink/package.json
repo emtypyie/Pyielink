@@ -1,7 +1,7 @@
-﻿{
+{
     "name":  "pyielink",
-    "version": "0.7.0",
-    "description":  "Pyielink remote access framework Ã¢â‚¬â€ connect to host via screen sharing, file transfer, and terminal",
+    "version": "0.7.3",
+    "description":  "Pyielink Framework is a remote machine access protocol developed by Emtypyie",
     "main":  "cli.js",
     "bin":  {
                 "pyielink":  "cli.js"
@@ -18,8 +18,9 @@
                 },
     "repository":  {
                        "type":  "git",
-                       "url":  "https://github.com/EMTYPYIE/Pyielink"
+                       "url":  "https://github.com/emtypyie/pyielink"
                    },
+    "homepage":  "https://emtypyie.in/pyielink",
     "keywords":  [
                      "pyielink",
                      "remote",

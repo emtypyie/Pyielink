@@ -11,9 +11,16 @@
 import { spawn } from "child_process";
 import process from "node:process";
 import dgram from "node:dgram";
-import { existsSync, openSync, writeSync, closeSync } from "node:fs";
+import { existsSync, openSync, writeSync, closeSync, appendFileSync } from "node:fs";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { Mux, CHANNELS } from "./mux.js";
+import { startClientRtc, applyClientSignal } from "./rtc.js";
+const LATENCY_CSV = path.join(process.env.TEMP || process.env.TMPDIR || ".", "pyielink-latency.csv");
+function latencyLog(stage, ms, extra="") {
+  try { appendFileSync(LATENCY_CSV, `${Date.now()},${stage},${ms.toFixed(2)},${extra}\n`); } catch {}
+}
 
 const require = createRequire(import.meta.url);
 const WebSocket = require("ws");
@@ -39,48 +46,33 @@ if (!args.host || !args.port || !args.key) {
 const MAX_ATTEMPTS = 5;
 const RECONNECT_DELAY_MS = 2000;
 
-// ---- mux framing (mirrors datalayer/src/mux.js) ----------------------------
-const HEADER = 5;
-const CH_CONTROL = 0x01;
-const CH_INPUT = 0x02;
-const CH_VIDEO = 0x03;
-
-class MuxReader {
-  constructor(onFrame) {
-    this.buf = Buffer.alloc(0);
-    this.onFrame = onFrame;
-  }
-  feed(chunk) {
-    this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
-    for (;;) {
-      if (this.buf.length < HEADER) return;
-      const channel = this.buf.readUInt8(0);
-      const len = this.buf.readUInt32BE(1);
-      if (this.buf.length < HEADER + len) return;
-      const payload = this.buf.subarray(HEADER, HEADER + len);
-      this.buf = this.buf.subarray(HEADER + len);
-      try {
-        this.onFrame(channel, payload);
-      } catch (e) {
-        log(`frame handler error: ${e.message}`);
-      }
-    }
-  }
-}
-
-function frame(channel, payload) {
-  const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
-  const out = Buffer.allocUnsafe(HEADER + body.length);
-  out.writeUInt8(channel, 0);
-  out.writeUInt32BE(body.length, 1);
-  body.copy(out, HEADER);
-  return out;
-}
-
 // ---- viewer lifecycle ------------------------------------------------------
 // Prefer ffplay (ships with ffmpeg full builds, opens its own window).
 // Fall back to `ffmpeg -f sdl2`. Both take MPEG-TS on stdin.
 let viewer = null;
+let mux = null;
+let rtcPc = null;
+let rtcStarted = false;
+let activeWs = null;
+let lastFps = 0;          // displayed decode fps (progress lines / sec)
+let ffplayTicks = 0;      // ffplay progress lines seen (1 per rendered frame)
+let lastFpsTick = 0;      // snapshot for per-second delta
+let fpsTimer = null;      // 1Hz fps display ticker
+let viewerRestarts = 0;   // bounded auto-restart after a viewer crash
+let hwaccelDisabled = false; // set if GPU decode fails to open the pipe
+const MAX_VIEWER_RESTARTS = 5;
+
+// Pick a GPU decoder for the viewer. `-hwaccel auto` is NOT used: it fails to
+// configure a decoder/filtergraph for a non-seekable pipe input. A specific
+// backend (d3d11va on Windows) opens the pipe fine. If it still fails on a
+// given machine, the stderr watcher flips hwaccelDisabled and we retry in
+// software mode.
+function pickHwaccel() {
+  if (process.env.PYIELINK_HWACCEL) return ["-hwaccel", process.env.PYIELINK_HWACCEL];
+  if (process.platform === "win32") return ["-hwaccel", "d3d11va"];
+  if (process.platform === "darwin") return ["-hwaccel", "videotoolbox"];
+  return []; // linux: software unless PYIELINK_HWACCEL set (vaapi/cuda/...)
+}
 
 function ensureViewer() {
   if (viewer) return;
@@ -92,25 +84,29 @@ function ensureViewer() {
   let kind;
   // Player stderr goes to a rolling temp file - keeps field debugging
   // possible without spamming the console.
-  const ffLog = openSync(process.env.TEMP + "\\pyielink-ffplay.log", "a");
+  const ffLog = openSync(path.join(process.env.TEMP || process.env.TMPDIR || ".", "pyielink-ffplay.log"), "a");
   try { writeSync(ffLog, `\n==== viewer spawn ${new Date().toISOString()} ====\n`); } catch {}
+  // GPU decode where available (d3d11va on Windows — opens the pipe cleanly,
+  // unlike `-hwaccel auto`). Falls back to software if it can't open.
+  let hwaccelArgs = hwaccelDisabled ? [] : pickHwaccel();
   const common = [
-    // NOTE: all input options (and -window_title) MUST come before -i,
-    // otherwise ffplay parses them as the input filename.
+    // Input options MUST come before -i; output options (-window_title) after.
     "-fflags", "+nobuffer",
-    "-probesize", "32",
-    "-analyzeduration", "0",
-    "-window_title", "Pyielink - Remote Screen",
-    "-loglevel", "error",
-    "-nostats",
+    "-probesize", "100000",
+    "-analyzeduration", "1000000",
+    ...hwaccelArgs,
+    "-f", "mpegts",
     "-i", "pipe:0",
+    "-window_title", "Pyielink - Remote Screen",
+    // NOTE: stats (not -nostats) so we can read the live decode fps; the
+    // progress lines go to stderr which we parse below.
   ];
   try {
-    proc = spawn("ffplay", common, { stdio: ["pipe", "ignore", ffLog] });
+    proc = spawn("ffplay", common, { stdio: ["pipe", "ignore", "pipe"] });
     kind = "ffplay";
   } catch {
     proc = spawn("ffmpeg", [...common, "-f", "sdl2", "Pyielink - Remote Screen"], {
-      stdio: ["pipe", "ignore", ffLog],
+      stdio: ["pipe", "ignore", "pipe"],
     });
     kind = "ffmpeg-sdl2";
   }
@@ -124,6 +120,22 @@ function ensureViewer() {
   });
   proc.stdin.on("error", (e) => log(`viewer stdin error: ${e.message}`));
   proc.on("error", (e) => log(`viewer error (${kind}): ${e.message}`));
+  // Capture ffplay stderr: mirror to the log file AND derive the live fps.
+  // This ffmpeg build's stats line has no `fps=` field; it emits one line per
+  // rendered frame ("  21.75 M-V: 0.063 fd= 29 ..."), so we count those.
+  proc.stderr.on("data", (d) => {
+    try { writeSync(ffLog, d); } catch {}
+    const s = d.toString();
+    // ffplay progress line (one per rendered frame). Format differs across
+    // builds: old "21.75 M-V: 0.063 fd= 29 ..." vs new "nan : 0.000 fd= 0 ...".
+    if (/^\s*[\d.nan+-]+\s*(?::|M-V:)\s*[\d.]+\s+fd=\s*\d+/.test(s)) ffplayTicks += 1;
+    // GPU decode couldn't open the pipe → drop to software and respawn once.
+    if (!hwaccelDisabled && /Failed to open file|configure filtergraph/.test(s)) {
+      hwaccelDisabled = true;
+      log("hwaccel decode failed to open pipe; restarting viewer in software mode");
+      try { proc.kill("SIGKILL"); } catch {}
+    }
+  });
   proc.on("close", (code) => {
     log(`viewer (${kind}) exited (code ${code})`);
     try {
@@ -131,9 +143,39 @@ function ensureViewer() {
       closeSync(ffLog);
     } catch {}
     if (viewer?.proc === proc) viewer = null;
+    if (fpsTimer) { clearInterval(fpsTimer); fpsTimer = null; }
+    // Stay alive across a network blip / viewer crash: if we're still
+    // connected, restart the viewer and keep rendering the next frames.
+    if (activeWs && activeWs.readyState === 1 && code !== 0 && viewerRestarts < MAX_VIEWER_RESTARTS) {
+      viewerRestarts += 1;
+      log(`restarting viewer (${viewerRestarts}/${MAX_VIEWER_RESTARTS})`);
+      setTimeout(ensureViewer, 500);
+    } else if (viewerRestarts >= MAX_VIEWER_RESTARTS) {
+      log(`viewer restart cap reached; leaving it stopped`);
+    }
   });
   viewer = { proc, kind };
   log(`viewer started: ${kind}`);
+  // 1Hz fps readout (only while connected + a viewer is live).
+  if (fpsTimer) clearInterval(fpsTimer);
+  fpsTimer = setInterval(() => {
+    if (viewer && activeWs && activeWs.readyState === 1) {
+      const fps = ffplayTicks - lastFpsTick;
+      lastFpsTick = ffplayTicks;
+      if (fps > 0) lastFps = fps; // smooth: keep last good value across gaps
+      log(`fps: ${lastFps.toFixed(1)}`);
+      // Mirror FPS into the player window title so it's visible on-screen.
+      if (process.platform === "win32") {
+        try {
+          const t = `Pyielink - Remote Screen (FPS: ${lastFps.toFixed(0)}${hwaccelDisabled ? "" : " GPU"})`;
+          const ps1 = fileURLToPath(new URL("./assets/set_title.ps1", import.meta.url));
+          spawn("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, "-ProcName", "ffplay", "-Title", t], { stdio: "ignore" }).unref();
+        } catch {}
+      }
+    } else {
+      lastFpsTick = ffplayTicks;
+    }
+  }, 1000);
   applyWindowIcon(iconImg);
 }
 
@@ -147,7 +189,7 @@ function applyWindowIcon(pngPath) {
     log(`icon skip: ps1=${existsSync(ps1)} img=${existsSync(pngPath)}`);
     return;
   }
-  const trace = process.env.TEMP + "\\pyielink-seticon.log";
+  const trace = path.join(process.env.TEMP || process.env.TMPDIR || ".", "pyielink-seticon.log");
   try {
     spawn("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass",
       "-File", ps1, "-ProcName", "ffplay", "-Image", pngPath, "-Trace", trace],
@@ -158,10 +200,14 @@ function applyWindowIcon(pngPath) {
 }
 
 // ---- input relay -----------------------------------------------------------
-// input_hook.ps1 (parked, detached) watches the player window and fires
-// normalized mouse/key events at a localhost UDP socket; we forward them
-// onto the INPUT channel. One helper per viewer window: kill any previous
-// instance before spawning a new one so reconnects never double-hook.
+// A platform capture helper watches the player window and fires normalized
+// mouse/key events at a localhost UDP socket; we forward them onto the INPUT
+// channel. One helper per viewer window: kill any previous instance before
+// spawning a new one so reconnects never double-hook.
+//
+//   win32 : assets/input_hook.ps1 (low-level hooks) / crosshair.ps1 (overlay)
+//   linux : assets/input_hook.py (X11 XRecord tap)
+//   darwin: assets/input_hook.py (Quartz CGEvent tap)
 let inputUdp = null;
 let inputHelper = null;
 
@@ -177,42 +223,73 @@ function stopInputRelay() {
   }
 }
 
-function startInputRelay(ws) {
-  stopInputRelay();
-  const ps1 = fileURLToPath(new URL("./assets/input_hook.ps1", import.meta.url));
-  if (!existsSync(ps1)) {
-    log("input helper missing, remote control disabled");
-    return;
+// Resolve the capture helper for this platform. kind: "crosshair" | "input".
+function captureHelper(kind) {
+  const a = fileURLToPath(new URL("./assets/", import.meta.url));
+  if (process.platform === "win32") {
+    if (kind === "crosshair") {
+      const cs = path.join(a, "crosshair.ps1");
+      if (existsSync(cs)) return { cmd: "powershell", script: cs };
+    }
+    const ps1 = path.join(a, "input_hook.ps1");
+    if (existsSync(ps1)) return { cmd: "powershell", script: ps1 };
+    return null;
+  }
+  if (process.platform === "linux" || process.platform === "darwin") {
+    const py = path.join(a, "input_hook.py");
+    if (existsSync(py)) return { cmd: "python3", script: py };
+    return null;
+  }
+  return null;
+}
+
+function buildHelperArgs(pick, port) {
+  const trace = path.join(process.env.TEMP || process.env.TMPDIR || ".", "pyielink-hook.log");
+  if (pick.script.endsWith(".ps1"))
+    return ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", pick.script,
+            "-ProcName", "ffplay", "-UdpPort", String(port), "-Trace", trace];
+  return [pick.script, "--port", String(port), "--proc", "ffplay", "--trace", trace];
+}
+
+function startCaptureRelay(state, helperKind) {
+  const pick = captureHelper(helperKind);
+  if (!pick) {
+    log("capture helper missing for " + process.platform + ", remote control disabled");
+    return null;
   }
   const sock = dgram.createSocket("udp4");
   sock.on("message", (buf) => {
-    const cur = activeWs;
-    if (cur && cur.readyState === WebSocket.OPEN) {
-      try { cur.send(frame(CH_INPUT, buf)); } catch {}
-    }
+    if (mux) { try { mux.send(CHANNELS.INPUT, buf); } catch {} }
   });
-  sock.on("error", (e) => log(`input udp error: ${e.message}`));
+  sock.on("error", (e) => log(`capture udp error: ${e.message}`));
   sock.bind(0, "127.0.0.1", () => {
     const port = sock.address().port;
-    const helper = spawn(
-      "powershell",
-      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
-       "-ProcName", "ffplay", "-UdpPort", String(port),
-       "-Trace", process.env.TEMP + "\\pyielink-hook.log"],
-      { stdio: "ignore" }
-    );
-    inputHelper = helper;
-    inputUdp = sock;
-    log(`input relay up (udp:${port}, pid:${helper.pid})`);
-    helper.on("exit", (c) => log(`input helper exited (code ${c})`));
+    const helper = spawn(pick.cmd, buildHelperArgs(pick, port), { stdio: "ignore" });
+    state.helper = helper;
+    state.udp = sock;
+    log(`capture relay up (${helperKind}, udp:${port}, pid:${helper.pid})`);
+    helper.on("exit", (c) => {
+      log(`capture helper exited (code ${c})`);
+      if (c !== 0 && helperKind === "crosshair") {
+        log("crosshair failed, falling back to hook");
+        if (state.udp) { try { state.udp.close(); } catch {} state.udp = null; }
+        startInputRelay();
+      }
+    });
   });
+  return sock;
+}
+
+function startInputRelay() {
+  stopInputRelay();
+  startCaptureRelay({ get helper() { return inputHelper; }, set helper(v) { inputHelper = v; }, get udp() { return inputUdp; }, set udp(v) { inputUdp = v; } }, "input");
 }
 
 // ---- crosshair overlay (Option A: distinct double cursor) ------------------
-// Transparent WPF window over ffplay's client area. Red '+' follows mouse
-// instantly (local), host white arrow follows after latency in video.
-// Coords bottom-left, clicks sent via same CH_INPUT path. Falls back to
-// input_hook if crosshair.ps1 missing or WPF unavailable.
+// Transparent WPF window over ffplay's client area (Windows only). Red '+'
+// follows the mouse instantly (local); the host's white arrow follows after
+// latency in the video. On Linux/mac the crosshair overlay isn't available,
+// so captureHelper("crosshair") falls through to the same input_hook.py path.
 let crosshairUdp = null;
 let crosshairHelper = null;
 
@@ -228,47 +305,13 @@ function stopCrosshairRelay() {
   }
 }
 
-function startCrosshairRelay(ws) {
+function startCrosshairRelay() {
   stopCrosshairRelay();
   stopInputRelay();
-  const ps1 = fileURLToPath(new URL("./assets/crosshair.ps1", import.meta.url));
-  if (!existsSync(ps1)) {
-    log("crosshair missing, falling back to hook");
-    return startInputRelay(ws);
-  }
-  const sock = dgram.createSocket("udp4");
-  sock.on("message", (buf) => {
-    const cur = activeWs;
-    if (cur && cur.readyState === WebSocket.OPEN) {
-      try { cur.send(frame(CH_INPUT, buf)); } catch {}
-    }
-  });
-  sock.on("error", (e) => log(`crosshair udp error: ${e.message}`));
-  sock.bind(0, "127.0.0.1", () => {
-    const port = sock.address().port;
-    const helper = spawn(
-      "powershell",
-      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
-       "-ProcName", "ffplay", "-UdpPort", String(port),
-       "-Trace", process.env.TEMP + "\\pyielink-crosshair.log"],
-      { stdio: "ignore" }
-    );
-    crosshairHelper = helper;
-    crosshairUdp = sock;
-    log(`crosshair relay up (udp:${port}, pid:${helper.pid})`);
-    helper.on("exit", (c) => {
-      log(`crosshair helper exited (code ${c})`);
-      if (c !== 0) {
-        log("crosshair failed, falling back to hook");
-        stopCrosshairRelay();
-        startInputRelay(ws);
-      }
-    });
-  });
+  startCaptureRelay({ get helper() { return crosshairHelper; }, set helper(v) { crosshairHelper = v; }, get udp() { return crosshairUdp; }, set udp(v) { crosshairUdp = v; } }, "crosshair");
 }
 
 // ---- session ---------------------------------------------------------------
-let activeWs = null;
 let attempt = 0;
 let reconnectTimer = null;
 
@@ -285,6 +328,30 @@ function scheduleReconnect(reason) {
   }, RECONNECT_DELAY_MS);
 }
 
+function signalHost(msg) {
+  if (activeWs && activeWs.readyState === 1) {
+    try { activeWs.send(JSON.stringify(msg)); } catch {}
+  }
+}
+
+function ensureRtc() {
+  if (rtcStarted) return;
+  rtcStarted = true;
+  if (process.env.PYIELINK_TRANSPORT === "tcp") {
+    log("[rtc] disabled (PYIELINK_TRANSPORT=tcp), using ws");
+    return;
+  }
+  startClientRtc({ mux, onSignal: signalHost, log: (m) => log(m) })
+    .then((pc) => { rtcPc = pc; })
+    .catch((e) => log(`[rtc] init failed, ws fallback: ${e.message}`));
+}
+
+async function handleOffer(msg) {
+  await ensureRtc();
+  if (!rtcPc) return;
+  await applyClientSignal(rtcPc, msg, signalHost, (m) => log(m));
+}
+
 function connect() {
   attempt += 1;
   const url = `ws://${args.host}:${args.port}/`;
@@ -293,71 +360,63 @@ function connect() {
   activeWs = ws;
 
   let authed = false;
-  const reader = new MuxReader((channel, payload) => {
-    if (!authed) return;
-    if (channel === CH_CONTROL) {
-      if (payload.toString("utf8") === "PING") {
-        ws.send(frame(CH_CONTROL, "PONG"));
-      }
-      return;
-    }
-    if (channel === CH_VIDEO && viewer) {
-      // Backpressure-aware pipe into the player: pause the socket while the
-      // OS pipe is saturated instead of buffering without bound.
-      try {
-        const ok = viewer.proc.stdin.write(payload);
-        if (!ok && ws.readyState === WebSocket.OPEN) {
-          try {
-            if (ws._socket && ws._socket.pause) ws._socket.pause();
-            else if (ws.pause) ws.pause();
-          } catch {}
-        }
-      } catch (e) {
-        log(`viewer write error: ${e.message}`);
-      }
-    }
-  });
 
   ws.on("open", () => {
     ws.send(JSON.stringify({ k: args.key }));
   });
 
   ws.on("message", (data, isBinary) => {
-    if (!isBinary) {
-      const ack = data.toString("utf8");
-      if (ack.includes('"ok":true')) {
-        authed = true;
-        attempt = 0;
-        log("data channel up");
-        ensureViewer();
-        ws.send(
-          frame(
-            CH_VIDEO,
-            JSON.stringify({ t: "video_start", monitor_index: 0, offset_x: 0, offset_y: 0, width: 0, height: 0 })
-          )
-        );
-        ws.send(frame(CH_INPUT, JSON.stringify({ t: "input_start" })));
-        // Option A: crosshair overlay (distinct red '+' vs white arrow in video)
-        // Fallback to legacy hook via --no-crosshair or if overlay missing.
-        const noCross = args.nocrosshair !== undefined || args["no-crosshair"] !== undefined || args.nocrosshair === "" || process.env.PYIELINK_NO_CROSSHAIR === "1";
-        if (noCross) startInputRelay(ws);
-        else startCrosshairRelay(ws);
-      } else {
-        log(`unexpected ack: ${ack.trim()}`);
-        ws.close();
-      }
-      return;
+    if (isBinary) return; // mux frames handled by Mux's own listener
+    const text = data.toString("utf8");
+    let msg = null;
+    try { msg = JSON.parse(text); } catch {}
+    if (msg && msg.ok === true) {
+      authed = true;
+      attempt = 0;
+      viewerRestarts = 0;
+      log("data channel up");
+      mux = new Mux(ws);
+      mux.on(CHANNELS.CONTROL, (payload) => {
+        if (payload.toString("utf8") === "PING") mux.send(CHANNELS.CONTROL, "PONG");
+      });
+      mux.on(CHANNELS.VIDEO, (payload) => {
+        if (!viewer) return;
+        try {
+          const ok = viewer.proc.stdin.write(payload);
+          // Only back-pressure the WebSocket when this channel is actually
+          // riding it; if the data channel is attached, DC has its own buffering
+          // and pausing the ws would stall CONTROL/heartbeat.
+          const onWs = !mux.dcMap || !mux.dcMap.get(CHANNELS.VIDEO);
+          if (!ok && onWs && ws.readyState === WebSocket.OPEN) {
+            try {
+              if (ws._socket && ws._socket.pause) ws._socket.pause();
+              else if (ws.pause) ws.pause();
+            } catch {}
+          }
+        } catch (e) { log(`viewer write error: ${e.message}`); }
+      });
+      ensureViewer();
+      mux.send(CHANNELS.VIDEO, JSON.stringify({ t: "video_start", monitor_index: 0, offset_x: 0, offset_y: 0, width: 0, height: 0 }));
+      mux.send(CHANNELS.INPUT, JSON.stringify({ t: "input_start" }));
+      const noCross = args.nocrosshair !== undefined || args["no-crosshair"] !== undefined || args.nocrosshair === "" || process.env.PYIELINK_NO_CROSSHAIR === "1";
+      if (noCross) startInputRelay();
+      else startCrosshairRelay();
+      ensureRtc();
+    } else if (msg && msg.t === "rtc_offer") {
+      handleOffer(msg);
+    } else if (!authed) {
+      log(`unexpected message: ${text.trim().slice(0, 80)}`);
     }
-    reader.feed(data);
   });
 
   ws.on("close", (code) => {
     if (authed) {
       log(`data layer closed (code ${code})`);
-      try { ws.send(frame(CH_INPUT, JSON.stringify({ t: "input_stop" }))); } catch {}
+      try { if (mux) mux.send(CHANNELS.INPUT, JSON.stringify({ t: "input_stop" })); } catch {}
       stopInputRelay();
       stopCrosshairRelay();
     }
+    if (rtcPc) { try { rtcPc.close(); } catch {} rtcPc = null; rtcStarted = false; }
     scheduleReconnect(`closed ${code}`);
   });
 

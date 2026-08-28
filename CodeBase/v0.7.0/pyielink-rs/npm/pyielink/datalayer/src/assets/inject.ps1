@@ -79,7 +79,7 @@ while ($true) {
         'rup'   { [PIKInj]::Mouse($x,$y,0xC001,0) | Out-Null; [PIKInj]::Mouse($x,$y,0xC010,0) | Out-Null }
         'mdown' { [PIKInj]::Mouse($x,$y,0xC001,0) | Out-Null; [PIKInj]::Mouse($x,$y,0xC020,0) | Out-Null }
         'mup'   { [PIKInj]::Mouse($x,$y,0xC001,0) | Out-Null; [PIKInj]::Mouse($x,$y,0xC040,0) | Out-Null }
-        'wheel' { [PIKInj]::Mouse($x,$y,0x0800,[uint32]([int32][int]$ev.delta)) | Out-Null }
+        'wheel' { [PIKInj]::Mouse($x,$y,0xC801,[uint32]([int32][int]$ev.delta)) | Out-Null } # VIRTUALDESK|ABSOLUTE|MOVE|WHEEL
         default { [PIKInj]::Mouse($x,$y,0xC001,0) | Out-Null }
       }
     }
