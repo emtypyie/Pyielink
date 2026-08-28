@@ -4,6 +4,11 @@
 
 PYIELINK FRAMEWORK is a remote machine access framework with peer-to-peer connection over encrypted internet.
 
+## Install
+
+- **npm:** `npm install -g pyielink`
+- **emtypyie.cli:** `/get pyielink` from https://emtypyie.in/cli — once installed it runs as `/pyielink` inside the CLI (the shell does not forward arguments)
+
 ## Commands
 
 | Command | What it does |
