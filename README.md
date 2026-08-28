@@ -14,7 +14,7 @@ npm install -g pyielink
 ```
 
 ### emtypyie.cli
-From https://emtypyie.in/cli, run:
+Requires **emtypyie.cli v3.5.x or newer**. From https://emtypyie.in/cli, run:
 ```
 /get pyielink
 ```
