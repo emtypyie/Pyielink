@@ -26,14 +26,20 @@ After install, `pyielink` (or `/pyielink`) is on your `PATH` — see Commands be
 
 | Command | What it does |
 |---|---|
-| `pyielink` | Interactive launcher. |
+| `pyielink` | Show usage / help (no arguments). |
 | `pyielink <user>@<ip>` | Connect to a peer. After authentication the data layer starts, video transmission begins, and the GUI window opens. |
-| `pyielink <user>@<ip> --repl` | Connect and open an interactive shell (like `ssh user@ip` — same terminal access, written in Rust; see v0.6.0 for reference). |
-| `pyielink enable [--port N]` | Open this device for connections and start the listener; prints the local IPs clients can target. |
-| `pyielink host` | Start the host / data layer. |
-| `pyielink adduser -m "<name>" -r "<role>"` | Create a local account (`role` is `user` or `admin`). |
-| `pyielink -h` | Show help. |
-| `pyielink -v` | Show version. |
+| `pyielink <user>@<ip> --repl` | Connect and open an interactive shell (like `ssh user@ip` — same terminal access, written in Rust). Also accepts `pyielink --repl <user>@<ip>`. |
+| `pyielink enable` | Enable this device for connections and start the listener. |
+| `pyielink enable --all` | Enable for connections from any IP. |
+| `pyielink enable --whitelist <IP>` | Enable, allowing connections only from the given IP. |
+| `pyielink adduser -m "<name>"` | Create a host user account (prompts for password). |
+| `pyielink adduser -m "<name>" -r "<role>"` | Create an account with `role` `user` or `admin`. |
+| `pyielink whitelist add <IP>` | Add an IP to the connection whitelist. |
+| `pyielink whitelist remove <IP>` | Remove an IP from the connection whitelist. |
+| `pyielink tunnel start` | Start a tunnel (`cloudflared` or `nginx`; requires the binary). |
+| `pyielink host` | Start the host listener and accept incoming connections (port 4242). |
+| `pyielink -h` / `--help` | Show help. |
+| `pyielink -v` / `--version` | Show version. |
 
 ## Docker
 
