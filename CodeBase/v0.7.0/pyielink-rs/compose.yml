@@ -3,8 +3,14 @@
 # Build:            docker compose build
 # Host (share screen):   docker compose up -d host
 # Viewer (watch screen): docker compose run --rm view
-#   set PYIELINK_HOST=<host-ip> in .env (or shell) before running `view`.
+#   edit pyielink.conf with the host IP, then:
+#     docker compose run --rm view
+#   (or override per run: docker compose run --rm -e PYIELINK_HOST=<host-ip> view)
 #   On headless machines the entrypoint starts Xvfb automatically.
+#
+# Settings come from the explicit config file pyielink.conf (mounted read-only);
+# no hidden .env file is used. Any of them can be overridden per-run with a
+# normal shell variable passed to docker compose.
 #
 # The session key is generated once and persisted in the `pyielink-data`
 # volume, so host + view stay paired across restarts.
@@ -17,10 +23,8 @@ services:
     command: ["host"]
     restart: unless-stopped
     init: true
-    environment:
-      - PYIELINK_DL_PORT=${PYIELINK_DL_PORT:-4243}
-      - PYIELINK_KEY=${PYIELINK_KEY:-}
     volumes:
+      - ./pyielink.conf:/app/pyielink.conf:ro
       - pyielink-data:/data
 
   view:
@@ -28,11 +32,8 @@ services:
     container_name: pyielink-view
     command: ["view"]
     init: true
-    environment:
-      - PYIELINK_HOST=${PYIELINK_HOST:?set PYIELINK_HOST=<host-ip> in .env or shell}
-      - PYIELINK_DL_PORT=${PYIELINK_DL_PORT:-4243}
-      - PYIELINK_KEY=${PYIELINK_KEY:-}
     volumes:
+      - ./pyielink.conf:/app/pyielink.conf:ro
       - pyielink-data:/data
     depends_on:
       - host

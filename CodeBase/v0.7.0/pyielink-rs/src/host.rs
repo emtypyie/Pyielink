@@ -457,9 +457,6 @@ fn pick_free_port() -> Option<u16> {
         .map(|a| a.port())
 }
 
-/// Write the single-use handoff file ("<key>\n<user>\n<role>") and spawn the
-/// Node server with PYIELINK_SESSION pointing at it; the child deletes the
-/// file on startup so the key never lingers on disk.
 /// Shared tunnel handshake file written by `pyielink tunnel start` and read by
 /// the host so a roaming client can reach both the bootstrap and data ports.
 fn tunnel_info_path() -> std::path::PathBuf {
@@ -481,36 +478,31 @@ fn read_tunnel_info() -> std::collections::HashMap<String, String> {
 /// Data-layer listen port: explicit PYIELINK_DATA_PORT, else the port the
 /// tunnel forwarded (`data_local`), else a random free port.
 fn resolve_data_port() -> Option<u16> {
-    if let Ok(p) = std::env::var("PYIELINK_DATA_PORT") {
-        if let Ok(port) = p.parse::<u16>() {
-            return Some(port);
-        }
-    }
-    if let Some(v) = read_tunnel_info().get("data_local") {
-        if let Ok(port) = v.parse::<u16>() {
-            return Some(port);
-        }
-    }
-    pick_free_port()
+    env_data_port().or_else(|| {
+        read_tunnel_info()
+            .get("data_local")
+            .and_then(|v| v.parse::<u16>().ok())
+    }).or_else(pick_free_port)
+}
+
+fn env_data_port() -> Option<u16> {
+    std::env::var("PYIELINK_DATA_PORT").ok().and_then(|p| p.parse().ok())
 }
 
 /// Public address returned to the client for the data layer. When tunneling,
 /// this is the tunnel's public `data` address so the client reaches it through
 /// cloudflared instead of the host's unreachable LAN IP.
 fn data_port_public(local: u16) -> String {
-    if let Ok(p) = std::env::var("PYIELINK_DATA_PUBLIC") {
-        if !p.is_empty() {
-            return p;
-        }
-    }
-    if let Some(v) = read_tunnel_info().get("data") {
-        if !v.is_empty() {
-            return v.clone();
-        }
-    }
-    local.to_string()
+    std::env::var("PYIELINK_DATA_PUBLIC")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .or_else(|| read_tunnel_info().get("data").cloned().filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| local.to_string())
 }
 
+/// Write the single-use handoff file ("<key>\n<user>\n<role>") and spawn the
+/// Node server with PYIELINK_SESSION pointing at it; the child deletes the
+/// file on startup so the key never lingers on disk.
 fn spawn_datalayer(
     session_key: &str,
     user: &str,

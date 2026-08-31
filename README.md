@@ -48,11 +48,15 @@ PYIELINK FRAMEWORK ships a single container image that runs either the **host**
 
 ```sh
 cd CodeBase/v0.7.0/pyielink-rs
-cp .env.example .env      # set PYIELINK_HOST=<host-ip>
+# edit pyielink.conf (set PYIELINK_HOST=<host-ip> for the viewer)
 docker compose build
 docker compose up -d host
 docker compose run --rm view
 ```
+
+Settings come from the explicit `pyielink.conf` file (no hidden `.env` file).
+You can also override any value per run, e.g.:
+`docker compose run --rm -e PYIELINK_HOST=<host-ip> view`.
 
 The session key is generated once and shared via the `pyielink-data` volume.
 On headless viewers the entrypoint starts `Xvfb` automatically; host screen

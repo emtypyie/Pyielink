@@ -1,11 +1,14 @@
 use std::env;
-use std::process;
-use std::process::Command;
-use std::process::Stdio;
+use std::process::{self, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::io::{BufRead, BufReader};
 
 use pyielink::creds::{add_to_whitelist, remove_from_whitelist, add_user, cmd_enable_with_flags};
+
+/// Read a port from the given env var, defaulting to `fallback` on missing/invalid values.
+fn env_port(name: &str, fallback: u16) -> u16 {
+    std::env::var(name).ok().and_then(|p| p.parse().ok()).unwrap_or(fallback)
+}
 
 fn print_usage() {
     eprintln!("usage: pyielink <command> [args...]");
@@ -205,19 +208,24 @@ fn main() {
 /// Spawn a cloudflared quick TCP tunnel to `localhost:<local_port>` and watch
 /// its output for the assigned `tcp://host:port` address.
 fn spawn_cloudflared(label: &str, local_port: u16, found: &Arc<Mutex<Option<String>>>) -> Option<std::process::Child> {
-    let mut cmd = Command::new("cloudflared");
-    cmd.args(["tunnel", "--url", &format!("tcp://localhost:{}", local_port)])
+    let mut child = Command::new("cloudflared")
+        .args(["tunnel", "--url", &format!("tcp://localhost:{}", local_port)])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().ok()?;
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    let label = label.to_string();
+    let found = Arc::clone(found);
+
+    // Parse the assigned tcp://host:port out of cloudflared's stdout.
     if let Some(out) = child.stdout.take() {
-        let found = Arc::clone(found);
-        let label = label.to_string();
+        let found = Arc::clone(&found);
+        let label = label.clone();
         std::thread::spawn(move || {
-            let reader = BufReader::new(out);
-            for line in reader.lines().flatten() {
+            for line in BufReader::new(out).lines().flatten() {
                 if let Some(idx) = line.find("tcp://") {
-                    let rest = &line[idx + 6..];
+                    let rest = &line[idx + "tcp://".len()..];
                     let end = rest
                         .find(|c| c == ' ' || c == '"' || c == '|' || c == '}' || c == '\n')
                         .unwrap_or(rest.len());
@@ -232,27 +240,22 @@ fn spawn_cloudflared(label: &str, local_port: u16, found: &Arc<Mutex<Option<Stri
             }
         });
     }
+
+    // Mirror stderr so cloudflared stays unblocked and errors are visible.
     if let Some(err) = child.stderr.take() {
-        let label = label.to_string();
         std::thread::spawn(move || {
-            let reader = BufReader::new(err);
-            for line in reader.lines().flatten() {
+            for line in BufReader::new(err).lines().flatten() {
                 println!("  [cloudflared/{}] {}", label, line);
             }
         });
     }
+
     Some(child)
 }
 
 fn run_tunnel_cloudflared() {
-    let bootstrap_port: u16 = std::env::var("PYIELINK_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(4242);
-    let data_port: u16 = std::env::var("PYIELINK_DATA_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(4243);
+    let bootstrap_port = env_port("PYIELINK_PORT", 4242);
+    let data_port = env_port("PYIELINK_DATA_PORT", 4243);
 
     println!(
         "  [tunnel] starting cloudflared quick tunnels (bootstrap :{}, data :{})",
@@ -263,17 +266,15 @@ fn run_tunnel_cloudflared() {
     let bootstrap_found = Arc::new(Mutex::new(None::<String>));
     let data_found = Arc::new(Mutex::new(None::<String>));
 
-    let mut b_child = match spawn_cloudflared("bootstrap", bootstrap_port, &bootstrap_found) {
+    let mut bootstrap_child = match spawn_cloudflared("bootstrap", bootstrap_port, &bootstrap_found) {
         Some(c) => c,
-        None => {
-            eprintln!("  [error] could not launch cloudflared — install it and ensure it is on PATH");
-            process::exit(1);
-        }
+        None => { eprintln!("  [error] could not launch cloudflared — install it and ensure it is on PATH"); process::exit(1); }
     };
-    let _d_child = match spawn_cloudflared("data", data_port, &data_found) {
+    // Kept alive for the process lifetime so the data tunnel isn't dropped.
+    let _data_child = match spawn_cloudflared("data", data_port, &data_found) {
         Some(c) => c,
         None => {
-            let _ = b_child.kill();
+            let _ = bootstrap_child.kill();
             eprintln!("  [error] could not launch cloudflared — install it and ensure it is on PATH");
             process::exit(1);
         }
@@ -321,14 +322,8 @@ fn run_tunnel_cloudflared() {
 }
 
 fn run_tunnel_nginx() {
-    let bootstrap_port: u16 = std::env::var("PYIELINK_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(4242);
-    let data_port: u16 = std::env::var("PYIELINK_DATA_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(4243);
+    let bootstrap_port = env_port("PYIELINK_PORT", 4242);
+    let data_port = env_port("PYIELINK_DATA_PORT", 4243);
     println!("  [tunnel/nginx] nginx 'stream' reverse-proxy config (run nginx on a PUBLIC VPS):");
     println!("  NOTE: nginx does NOT traverse NAT on its own — the host must be reachable from");
     println!("  the nginx server. For NAT traversal from a private host, use 'cloudflared'.");
