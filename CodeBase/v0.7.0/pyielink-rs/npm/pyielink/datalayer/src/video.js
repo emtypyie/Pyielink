@@ -39,6 +39,22 @@ function resolveEncode(codec, presets, tunes, extra) {
     return cfg;
 }
 
+// Probe whether an ffmpeg capture input can actually open (e.g. ddagrab needs a
+// GPU + active Desktop Duplication session; on GPU-less / RDP / VM hosts it
+// fails and we must fall back to gdigrab).
+function ffmpegCaptureWorks(fmt, arg) {
+    try {
+        const r = spawnSync("ffmpeg", [
+            "-hide_banner", "-t", "0.3",
+            "-f", fmt, "-i", arg,
+            "-f", "null", "-"
+        ], { timeout: 8000, stdio: "ignore" });
+        return r.status === 0;
+    } catch (_) {
+        return false;
+    }
+}
+
 
 const CHUNK_SIZE = 1200; // MTU-friendly: 1200B < 1500 MTU, vs 64K bursty (NALU slicer)
 const FFMPEG_RESTART_DELAY = 2000;
@@ -206,8 +222,17 @@ export class VideoService {
 
         const hw = probeHardware(this.log);
         const cap = pickCapture(hw);
-        const inputFormat = cap.fmt;
+        let inputFormat = cap.fmt;
         let inputArg = cap.arg;
+        // ddagrab (ffmpeg's DXGI Desktop Duplication) needs a GPU + active
+        // Desktop Duplication session — unavailable on GPU-less / RDP / VM hosts.
+        // Probe it; if it fails, fall back to gdigrab (CPU/GDI), which works
+        // without a GPU as long as a desktop session exists.
+        if (inputFormat === "ddagrab" && !ffmpegCaptureWorks("ddagrab", inputArg)) {
+            this.log("[video] ddagrab unavailable (no DXGI/Desktop Duplication) — using gdigrab");
+            inputFormat = "gdigrab";
+            inputArg = "desktop";
+        }
         const framerate = cap.fr;
         const inputOpts = [];
         if (this.monitorWidth > 0 && this.monitorHeight > 0) {
