@@ -95,11 +95,27 @@ function probeHardware(log) {
 
 // Choose the best screen-capture input for the current OS, based on what ffmpeg
 // supports here. Cross-platform: Windows ddagrab/gdigrab, Linux pipewire/x11grab,
-// macOS avfoundation.
+// macOS avfoundation. Tries DXGI first on Windows when dxgi_capture.exe is present,
+// then falls back to native ffmpeg grab methods.
 function pickCapture(hw) {
   const p = process.platform;
+  const captureEnv = process.env.PYIELINK_CAPTURE; // "dxgi" | "gdigrab"
+
   if (p === "win32") {
-    if (hw.captures.includes("ddagrab")) return { fmt: "ddagrab", arg: "desktop", fr: "60" };
+    // Respect explicit env override first
+    if (captureEnv === "gdigrab") return { fmt: "gdigrab", arg: "desktop", fr: "60" };
+    if (captureEnv === "dxgi") {
+      // User explicitly asked for DXGI; still check if helper exists
+      const dxgiExe = path.join(ASSETS, "dxgi_capture.exe");
+      if (existsSync(dxgiExe)) return { fmt: "ddagrab", arg: "desktop", fr: "60" };
+      this.log &&
+        this.log("[video] PYIELINK_CAPTURE=dxgi set but dxgi_capture.exe missing; falling back to gdigrab");
+      return { fmt: "gdigrab", arg: "desktop", fr: "60" };
+    }
+    // Default: try ddagrab (DXGI Desktop Duplication) if helper exists,
+    // otherwise fall back to gdigrab (GDI BitBlt).
+    const dxgiExe = path.join(ASSETS, "dxgi_capture.exe");
+    if (existsSync(dxgiExe)) return { fmt: "ddagrab", arg: "desktop", fr: "60" };
     return { fmt: "gdigrab", arg: "desktop", fr: "60" };
   }
   if (p === "linux") {
@@ -109,6 +125,7 @@ function pickCapture(hw) {
   if (p === "darwin") {
     return { fmt: "avfoundation", arg: "1:none", fr: "60" };
   }
+  // Fallback for any other platform
   return { fmt: "gdigrab", arg: "desktop", fr: "60" };
 }
 
@@ -228,11 +245,29 @@ export class VideoService {
         // Desktop Duplication session — unavailable on GPU-less / RDP / VM hosts.
         // Probe it; if it fails, fall back to gdigrab (CPU/GDI), which works
         // without a GPU as long as a desktop session exists.
-        if (inputFormat === "ddagrab" && !ffmpegCaptureWorks("ddagrab", inputArg)) {
-            this.log("[video] ddagrab unavailable (no DXGI/Desktop Duplication) — using gdigrab");
-            inputFormat = "gdigrab";
-            inputArg = "desktop";
-        }
+if (inputFormat === "ddagrab" && !this.dxgiForcedOff) {
+            // DDagrab requires the dxgi_capture.exe helper; if it's not available
+            // or was previously forced off, skip the ffmpeg probe and go straight to gdigrab.
+            if (!existsSync(dxgiExe)) {
+              this.log("[video] ddagrab selected but dxgi_capture.exe missing — using gdigrab");
+              inputFormat = "gdigrab";
+              inputArg = "desktop";
+            } else {
+              // Probe dxgrab availability via ffmpeg; if it fails, fall back to gdigrab.
+              try {
+                const works = ffmpegCaptureWorks("ddagrab", inputArg);
+                if (!works) {
+                  this.log("[video] ddagrab ffmpeg probe failed — using gdigrab");
+                  inputFormat = "gdigrab";
+                  inputArg = "desktop";
+                }
+              } catch (e) {
+                this.log(`[video] ddagrab probe exception (${e.message}); falling back to gdigrab`);
+                inputFormat = "gdigrab";
+                inputArg = "desktop";
+              }
+            }
+          }
         const framerate = cap.fr;
         const inputOpts = [];
         if (this.monitorWidth > 0 && this.monitorHeight > 0) {
