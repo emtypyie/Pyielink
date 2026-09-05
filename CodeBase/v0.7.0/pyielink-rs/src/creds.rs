@@ -55,7 +55,10 @@ fn key_path() -> std::path::PathBuf {
     token::pyielink_dir().join("host.key")
 }
 
-fn master_key() -> std::io::Result<[u8; 32]> {
+/// Load the master key from host.key if it exists.
+/// Returns an error if the file is missing or corrupt — callers should
+/// handle first‑run key creation explicitly (e.g. via init_key()).
+fn load_master_key() -> std::io::Result<[u8; 32]> {
     match std::fs::read_to_string(key_path()) {
         Ok(body) => {
             let raw = token::from_hex(body.trim())
@@ -70,22 +73,33 @@ fn master_key() -> std::io::Result<[u8; 32]> {
             out.copy_from_slice(&raw);
             Ok(out)
         }
-        Err(_) => {
-            use rand::RngCore;
-            let mut k = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut k);
-            let p = key_path();
-            if let Some(parent) = p.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&p, token::to_hex(&k))?;
-            Ok(k)
-        }
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "host.key not found",
+        )),
     }
 }
 
+/// Generate a new master key and write it to host.key.
+/// Meant for first‑run initialization; will not overwrite an existing key.
+pub fn init_key() -> std::io::Result<[u8; 32]> {
+    let p = key_path();
+    if p.exists() {
+        // Key already exists — don't overwrite; just load it instead.
+        return load_master_key();
+    }
+    use rand::RngCore;
+    let mut k = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut k);
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&p, token::to_hex(&k))?;
+    Ok(k)
+}
+
 fn seal_state(json: &str) -> std::io::Result<String> {
-    let key = master_key()?;
+    let key = load_master_key()?;
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "aes init"))?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
@@ -101,10 +115,25 @@ fn unseal_state(body: &str) -> Option<String> {
         return None;
     }
     let nonce_hex = &rest[..24];
-    let ct = token::from_hex(&rest[24..])?;
-    let key = master_key().ok()?;
-    let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
-    let plain = cipher.decrypt(Nonce::from_slice(token::from_hex(nonce_hex)?.as_slice()), ct.as_ref()).ok()?;
+    let ct = match token::from_hex(&rest[24..]) {
+        Some(v) => v,
+        None => return None,
+    };
+    let key = match load_master_key() {
+        Ok(v) => v,
+        _ => return None,
+    };
+    let cipher = match Aes256Gcm::new_from_slice(&key) {
+        Ok(v) => v,
+        _ => return None,
+    };
+    let plain = match cipher.decrypt(
+        Nonce::from_slice(token::from_hex(nonce_hex)?.as_slice()),
+        ct.as_ref(),
+    ) {
+        Ok(v) => v,
+        _ => return None,
+    };
     String::from_utf8(plain).ok()
 }
 
@@ -139,6 +168,9 @@ pub fn save_state(state: &HostState) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Ensure host.key exists; create it on first run if missing.
+    // init_key() will not overwrite an existing key.
+    init_key()?;
     // Escape hatch for test harnesses and CI that inspect/edit the state
     // file directly. Never set this on a real deployment.
     let body = if std::env::var("PYIELINK_PLAINTEXT_STATE").as_deref() == Ok("1") {
