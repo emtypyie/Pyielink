@@ -6,22 +6,57 @@
 // AudioService, InputService and FileService keep calling mux.send() unchanged.
 //
 // Signaling (SDP + ICE) rides the already-authenticated data-layer WebSocket as
-// TEXT messages: {t:"rtc_offer",sdp} / {t:"rtc_answer",sdp} / {t:"rtc_ice",cand}.
+// TEXT messages: {t:"rtc_offer",sdp} / {t:"rtc_answer",sdp} / {t:"rtc_ice",cand}
 // If WebRTC fails to establish, callers simply never attach channels and the
 // Mux keeps using the WebSocket for everything (PYIELINK_TRANSPORT=tcp).
 
 import { RTCPeerConnection } from "werift";
 import { CHANNELS } from "./mux.js";
 
+function isValidUrl(url: string): boolean {
+  try {
+    new URL(url);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function iceServers() {
-  const out = (process.env.PYIELINK_STUN || "stun:stun.l.google.com:19302")
-    .split("|").map((u) => ({ urls: u.trim() })).filter((s) => s.urls);
+  // Parse STUN URLs from env (pipe-separated), trim whitespace, validate
+  const stunUrls = (process.env.PYIELINK_STUN || "")
+    .split("|")
+    .map((u) => u.trim())
+    .filter((u) => u && isValidUrl(u));
+
+  // Build output array with proper format
+  const out: Array<{ urls: string | Array<string>; username?: string; credential?: string }> = [];
+
+  // Add default STUN if none provided via env
+  if (stunUrls.length === 0) {
+    out.push({ urls: "stun:stun.l.google.com:19302" });
+  } else {
+    for (const u of stunUrls) {
+      out.push({ urls: u });
+    }
+  }
+
+  // Parse TURN entries: format is url|username|credential, entries separated by |
+  // Allow multiple TURN entries by repeating the pattern: url1|user1|cred1|url2|user2|cred2|...
   const turn = process.env.PYIELINK_TURN;
   if (turn) {
-    // Format: url|username|credential
-    const [url, username, credential] = turn.split("|");
-    if (url) out.push({ urls: url, username, credential });
+    const turnEntries = turn.split("|");
+    // Process in groups of 3: url, username, credential
+    for (let i = 0; i + 2 < turnEntries.length; i += 3) {
+      const url = turnEntries[i].trim();
+      const username = turnEntries[i + 1]?.trim();
+      const credential = turnEntries[i + 2]?.trim();
+      if (url && isValidUrl(url)) {
+        out.push({ urls: url, username, credential });
+      }
+    }
   }
+
   return out;
 }
 
@@ -33,7 +68,7 @@ const LABELS = {
   file: [CHANNELS.FILE_META, CHANNELS.FILE_CHUNK],
 };
 
-function candidateToJSON(c) {
+function candidateToJSON(c: any): any {
   if (!c) return null;
   if (typeof c.toJSON === "function") return c.toJSON();
   if (c.candidate) return c; // already an object
@@ -66,7 +101,8 @@ export async function startHostRtc({ mux, onSignal, log }) {
     if (cand) onSignal({ t: "rtc_ice", cand });
   });
   pc.on("error", (e) => log?.(`[rtc] host pc error: ${e?.message || e}`));
-  pc.on("connectionstatechange", () => log?.(`[rtc] connectionState=${pc.connectionState}`));
+  pc.on("connectionstatechange", () => log?.(`[rtc] host connectionState=${pc.connectionState}`));
+  pc.on("iceconnectionstatechange", () => log?.(`[rtc] host iceState=${pc.iceConnectionState}`));
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   onSignal({ t: "rtc_offer", sdp: JSON.stringify(pc.localDescription) });
@@ -87,7 +123,8 @@ export async function startClientRtc({ mux, onSignal, log }) {
     if (cand) onSignal({ t: "rtc_ice", cand });
   });
   pc.on("error", (e) => log?.(`[rtc] client pc error: ${e?.message || e}`));
-  pc.on("connectionstatechange", () => log?.(`[rtc] connectionState=${pc.connectionState}`));
+  pc.on("connectionstatechange", () => log?.(`[rtc] client connectionState=${pc.connectionState}`));
+  pc.on("iceconnectionstatechange", () => log?.(`[rtc] client iceState=${pc.iceConnectionState}`));
   log?.("[rtc] client peer created, awaiting offer");
   return pc;
 }
