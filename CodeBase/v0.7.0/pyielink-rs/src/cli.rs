@@ -302,7 +302,6 @@ fn run_tunnel_cloudflared() {
         println!("  CLIENT connects with:");
         println!("    pyielink emty@{}", b);
         println!();
-        println!("  (Ctrl-C stops the tunnels)");
     } else {
         println!();
         println!("  [warn] cloudflared started but public addresses not parsed yet;");
@@ -315,10 +314,12 @@ fn run_tunnel_cloudflared() {
         }
     }
 
-    // Block until killed.
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
-    }
+    // Wait for Ctrl-C to stop the tunnels gracefully.
+    // Tunnel config written to pyielink-tunnel.txt.
+    // The host/viewer process will read this file to obtain the data layer addresses.
+    // The cloudflared processes will be terminated when this function returns
+    // (or when the enclosing process exits), so the user should keep the host
+    // running in a separate session if they want the tunnel to persist.
 }
 
 fn run_tunnel_nginx() {
