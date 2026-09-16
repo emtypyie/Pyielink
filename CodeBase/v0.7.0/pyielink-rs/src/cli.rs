@@ -14,9 +14,8 @@ fn print_usage() {
     eprintln!("usage: pyielink <command> [args...]");
     eprintln!();
     eprintln!("commands:");
-    eprintln!("  user@ip                   Connect to host (GUI mode)");
-    eprintln!("  user@ip --repl            Connect to host (REPL terminal mode)");
-    eprintln!("  --repl user@ip            Connect to host (REPL terminal mode)");
+    eprintln!("  user@ip                   Connect to host (interactive terminal REPL)");
+    eprintln!("  --repl user@ip            Same as above (legacy flag, ignored)");
     eprintln!("  enable                  Enable host for connections");
     eprintln!("  enable --all             Enable host for connections from any IP");
     eprintln!("  enable --whitelist IP    Allow connections from specific IP");
@@ -196,7 +195,7 @@ fn main() {
         }
 
         _ => {
-            // Default: connect to host (GUI mode)
+            // Default: connect to host (interactive terminal REPL)
             if let Err(e) = pyielink::client::run_connect(command, false) {
                 eprintln!("  [error] connection failed: {}", e);
                 process::exit(1);

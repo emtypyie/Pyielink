@@ -26,10 +26,6 @@ const DL_CH_META: u8 = 0x04;
 const DL_CH_CHUNK: u8 = 0x05;
 /// input channel (mirrors CHANNELS.INPUT = 0x02)
 const DL_CH_INPUT: u8 = 0x02;
-/// video channel (mirrors CHANNELS.VIDEO = 0x03)
-const DL_CH_VIDEO: u8 = 0x03;
-/// audio channel (mirrors CHANNELS.AUDIO = 0x06)
-const DL_CH_AUDIO: u8 = 0x06;
 /// chunk size + how many chunks we push per service-loop pass so dl
 /// heartbeats keep flowing while an upload drains (backpressure is the
 /// blocking TCP write; pacing keeps the control loop alive)
@@ -44,14 +40,13 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 /// delay between reconnection attempts
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
-/// Adaptive bitrate constants
-const BITRATE_REQUEST_INTERVAL: Duration = Duration::from_secs(5);
-const MIN_BITRATE_KBPS: u32 = 500;
-const MAX_BITRATE_KBPS: u32 = 20000;
-
-/// Global video control channel for sending pause/resume from GUI
+/// Global video control channel for the (currently disabled) GUI viewer.
+/// Nothing consumes this channel while the video layer is broken, so sends
+/// simply fail — the GUI ignores them. Kept only so the withdrawn egui
+/// viewer crate compiles.
 static VIDEO_CONTROL_TX: OnceLock<mpsc::Sender<DlCommand>> = OnceLock::new();
 
+/// Returns the video-control sender, if the GUI crate populated it.
 pub fn video_control_sender() -> Option<mpsc::Sender<DlCommand>> {
     VIDEO_CONTROL_TX.get().cloned()
 }
@@ -99,8 +94,40 @@ pub enum DlCommand {
     Input { events: Vec<InputEvent> },
     InputStart,
     InputStop,
+    /// list a remote directory (`readdir` on the FILE_META channel)
+    ListDir { path: String },
+    CreateDir { path: String },
+    Delete { path: String, recursive: bool },
+    Rename { old: String, new: String },
+    // Video layer is currently DISABLED across the codebase. These variants
+    // (and the start_cmd arms below) exist only so the withdrawn egui viewer
+    // crate keeps type-checking; they print a notice and do nothing.
     VideoPause,
     VideoResume,
+}
+
+/// One entry in a remote directory listing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    /// modification time in epoch milliseconds (host-reported)
+    pub mtime: Option<u64>,
+}
+
+/// Result of a remote `readdir` request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirListing {
+    pub path: String,
+    pub entries: Vec<DirEntry>,
+}
+
+/// Async results delivered from the data-link thread back to the REPL.
+#[derive(Debug, Clone)]
+pub enum RemoteEvent {
+    DirListing(DirListing),
+    OpResult { op: String, ok: bool, msg: String },
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -208,20 +235,6 @@ pub fn parse_target(arg: &str) -> Result<(String, String), String> {
     Ok((user.to_string(), ip.to_string()))
 }
 
-/// Split `host` or `host:port` into (host, optional port). IPv6 (containing
-/// ':') without a trailing `:digits` is treated as a bare host.
-fn split_host_port(s: &str) -> (String, Option<u16>) {
-    if let Some(idx) = s.rfind(':') {
-        let (h, p) = s.split_at(idx);
-        if !p[1..].is_empty() && p[1..].chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(port) = p[1..].parse::<u16>() {
-                return (h.to_string(), Some(port));
-            }
-        }
-    }
-    (s.to_string(), None)
-}
-
 fn prompt_password() -> String {
     print!("password: ");
     let _ = std::io::stdout().flush();
@@ -237,311 +250,23 @@ fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
 }
 
-/// Shared authentication logic: performs handshake, challenge-response, license, and promotion.
-/// Returns (data_port, session_key, SessionState, addr, bootstrap stream).
-/// The returned stream must stay open: the host serves heartbeats on it and
-/// tears the data layer down as soon as it dies.
-fn authenticate(
-    target: &str,
-) -> Result<(String, String, SessionState, String, std::net::TcpStream), String> {
-    let (user, ip) = parse_target(target)?;
-    let (host, target_port) = split_host_port(&ip);
-    let port: u16 = target_port
-        .or_else(|| std::env::var("PYIELINK_PORT").ok().and_then(|p| p.parse().ok()))
-        .unwrap_or(BOOTSTRAP_PORT);
-    let addr = format!("{}:{}", host, port);
-
-    let mut stream = TcpStream::connect(&addr)
-        .map_err(|e| format!("cannot reach {} — is the host running /enable? ({})", addr, e))?;
-    stream.set_nodelay(true).map_err(|e| e.to_string())?;
-    stream.set_read_timeout(Some(CONNECT_TIMEOUT)).map_err(|e| e.to_string())?;
-
-    let hello = format!("{}\n{}\n", user, env!("CARGO_PKG_VERSION"));
-    proto::write_frame(&mut stream, HELLO, hello.as_bytes())
-        .map_err(|e| format!("handshake send failed: {}", e))?;
-
-    let mut session_state: Option<SessionState> = None;
-    let keep_stream: Option<std::net::TcpStream>;
-
-    loop {
-        // Authenticate / re-authenticate
-        let (data_port, session_key) = if let Some(ref state) = session_state {
-            // Re-authenticate to get new ticket
-            println!("  [reconnect] re-authenticating for session resume...");
-            let mut auth_stream = TcpStream::connect(&addr)
-                .map_err(|e| format!("cannot reach {} for re-auth: {}", addr, e))?;
-            auth_stream.set_nodelay(true).map_err(|e| e.to_string())?;
-            auth_stream.set_read_timeout(Some(CONNECT_TIMEOUT)).map_err(|e| e.to_string())?;
-
-            let hello = format!("{}\n{}\n", state.user, env!("CARGO_PKG_VERSION"));
-            proto::write_frame(&mut auth_stream, HELLO, hello.as_bytes())
-                .map_err(|e| format!("re-auth handshake failed: {}", e))?;
-
-                    let mut attempts = 0u32;
-            loop {
-                match expect_frame(&mut auth_stream)? {
-                    (CHALLENGE, payload) => {
-                        let line = String::from_utf8_lossy(&payload).into_owned();
-                        let (salt, nonce) = match line.split_once('\n') {
-                            Some(x) => (x.0.to_string(), x.1.trim().to_string()),
-                            None => return Err("malformed challenge from host".into()),
-                        };
-                        // Password is required on every connection by
-                        // default; stored tokens are never used to skip it.
-                        if attempts >= 3 {
-                            return Err("too many failed authentication attempts".into());
-                        }
-                        attempts += 1;
-                        let framed = format!("p:{}", password_proof(&salt, &nonce));
-                        proto::write_frame(&mut auth_stream, PROOF, framed.as_bytes())
-                            .map_err(|e| format!("send failed: {}", e))?;
-                    }
-                    (LICENSE_TEXT, payload) => {
-                        if license_preaccepted() {
-                            println!("  [i] agreement pre-accepted via PYIELINK_ACCEPT_LICENSE");
-                        } else {
-                            println!("\n{}", String::from_utf8_lossy(&payload));
-                            if !confirm_license() {
-                                proto::write_frame(&mut auth_stream, LICENSE_REJECT, b"n")
-                                    .map_err(|e| e.to_string())?;
-                                return Err("license rejected — session aborted".into());
-                            }
-                        }
-                        proto::write_frame(&mut auth_stream, LICENSE_ACCEPT, b"y")
-                            .map_err(|e| e.to_string())?;
-                    }
-                    (TOKEN_ISSUED, _payload) => {
-                        // Host still issues tokens; the client deliberately
-                        // does not store them — password is required each time.
-                    }
-                    (AUTH_OK, payload) => {
-                        let ticket = String::from_utf8_lossy(&payload).into_owned();
-                        let (data_port, session_key) = split_ticket(ticket.trim())?;
-                        println!(
-                            "  [ok] session re-promoted. data layer ready on {}:{}. session key received.",
-                            state.ip, data_port
-                        );
-                        keep_stream = Some(auth_stream);
-                        break (data_port, session_key);
-                    }
-                    (AUTH_FAIL, payload) => {
-                        return Err(format!(
-                            "host refused: {}",
-                            String::from_utf8_lossy(&payload).trim()
-                        ));
-                    }
-                    (msg, _) => {
-                        return Err(format!("unexpected frame 0x{:02X} during handshake", msg));
-                    }
-                }
-            }
-        } else {
-            // Initial authentication
-            let mut stream = TcpStream::connect(&addr)
-                .map_err(|e| format!("cannot reach {} — is the host running /enable? ({})", addr, e))?;
-            stream.set_nodelay(true).map_err(|e| e.to_string())?;
-            stream.set_read_timeout(Some(CONNECT_TIMEOUT)).map_err(|e| e.to_string())?;
-
-            let hello = format!("{}\n{}\n", user, env!("CARGO_PKG_VERSION"));
-            proto::write_frame(&mut stream, HELLO, hello.as_bytes())
-                .map_err(|e| format!("handshake send failed: {}", e))?;
-
-                    let mut attempts = 0u32;
-
-            loop {
-                match expect_frame(&mut stream)? {
-                    (CHALLENGE, payload) => {
-                        let line = String::from_utf8_lossy(&payload).into_owned();
-                        let (salt, nonce) = match line.split_once('\n') {
-                            Some(x) => (x.0.to_string(), x.1.trim().to_string()),
-                            None => return Err("malformed challenge from host".into()),
-                        };
-                        // Password is required on every connection by
-                        // default; stored tokens are never used to skip it.
-                        if !creds::stdin_is_tty()
-                            && std::env::var("PYIELINK_SHELL").as_deref() != Ok("1")
-                        {
-                            return Err(format!(
-                                "password required for {}@{} — run from an interactive terminal (or set PYIELINK_SHELL=1 for scripted use)",
-                                user, ip
-                            ));
-                        }
-                        if attempts >= 3 {
-                            return Err("too many failed authentication attempts".into());
-                        }
-                        attempts += 1;
-                        let framed = format!("p:{}", password_proof(&salt, &nonce));
-                        proto::write_frame(&mut stream, PROOF, framed.as_bytes())
-                            .map_err(|e| format!("send failed: {}", e))?;
-                    }
-                    (LICENSE_TEXT, payload) => {
-                        if license_preaccepted() {
-                            println!("  [i] agreement pre-accepted via PYIELINK_ACCEPT_LICENSE");
-                        } else {
-                            println!("\n{}", String::from_utf8_lossy(&payload));
-                            if !confirm_license() {
-                                proto::write_frame(&mut stream, LICENSE_REJECT, b"n")
-                                    .map_err(|e| e.to_string())?;
-                                return Err("license rejected — session aborted".into());
-                            }
-                        }
-                        proto::write_frame(&mut stream, LICENSE_ACCEPT, b"y")
-                            .map_err(|e| e.to_string())?;
-                    }
-                    (TOKEN_ISSUED, _payload) => {
-                        // Not stored: password is required each connection.
-                    }
-                    (AUTH_OK, payload) => {
-                        let ticket = String::from_utf8_lossy(&payload).into_owned();
-                        let (data_port, session_key) = split_ticket(ticket.trim())?;
-                        println!(
-                            "  [ok] session promoted. data layer ready on {}:{}. session key received.",
-                            ip, data_port
-                        );
-                        keep_stream = Some(stream);
-                        break (data_port, session_key);
-                    }
-                    (AUTH_FAIL, payload) => {
-                        return Err(format!(
-                            "host refused: {}",
-                            String::from_utf8_lossy(&payload).trim()
-                        ));
-                    }
-                    (msg, _) => {
-                        return Err(format!("unexpected frame 0x{:02X} during handshake", msg));
-                    }
-                }
-            }
-        };
-
-        // Initialize or update session state
-        if session_state.is_none() {
-            session_state = Some(SessionState::new(user.clone(), host.clone(), session_key.clone(), data_port.clone()));
-        } else {
-            session_state.as_mut().unwrap().session_key = session_key.clone();
-            session_state.as_mut().unwrap().data_port = data_port.clone();
-        }
-
-        let session_state = session_state.unwrap();
-        let stream = keep_stream
-            .ok_or_else(|| "internal: authenticated without a live bootstrap stream".to_string())?;
-        return Ok((data_port, session_key, session_state, addr, stream));
-    }
+pub fn run_connect(target: &str, _repl_mode: bool) -> Result<(), String> {
+    // Single client mode: the remote terminal + file-explorer REPL.
+    // The native GUI crate is discontinued; `--repl` and bare `user@ip`
+    // behave identically.
+    run_session(target, RunMode::Shell)
 }
 
-pub fn run_connect(target: &str, repl_mode: bool) -> Result<(), String> {
-    if repl_mode {
-        run_session(target, RunMode::Shell)
-    } else {
-        // GUI mode: Rust handles only the bootstrap handshake + session
-        // keepalive; the data link (video window included) is served by the
-        // bundled Node viewer (datalayer/src/client_view.js).
-        run_gui_session_node(target)
-    }
-}
-
-/// Resolve datalayer/src/client_view.js next to this install.
-fn gui_viewer_script() -> Option<std::path::PathBuf> {
-    if let Ok(base) = std::env::var("PYIELINK_DATALAYER") {
-        let base = std::path::PathBuf::from(base);
-        let p = base.join("datalayer").join("src").join("client_view.js");
-        if p.exists() {
-            return Some(p);
-        }
-        let p = base.join("src").join("client_view.js");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        let mut anc = exe.parent().map(|p| p.to_path_buf());
-        for _ in 0..2 {
-            if let Some(dir) = anc {
-                let p = dir.join("datalayer").join("src").join("client_view.js");
-                if p.exists() {
-                    return Some(p);
-                }
-                anc = dir.parent().map(|p| p.to_path_buf());
-            }
-        }
-    }
-    None
-}
-
-/// GUI session: bootstrap auth (Rust) + Node viewer process for everything else.
-fn run_gui_session_node(target: &str) -> Result<(), String> {
-    use std::process::{Command, Stdio};
-
-    let script = gui_viewer_script().ok_or_else(|| {
-        "viewer not found: datalayer/src/client_view.js missing from this install".to_string()
-    })?;
-
-    // Authenticate and get the data-layer ticket.
-    let (data_port, session_key, session_state, _addr, bootstrap_stream) = authenticate(target)?;
-
-    // Keep the bootstrap session alive while the viewer runs — the host tears
-    // the data layer down the moment this socket dies.
-    let stop = Arc::new(AtomicU8::new(0));
-    let ka_stop = Arc::clone(&stop);
-    std::thread::spawn(move || {
-        bootstrap_keepalive(bootstrap_stream, ka_stop);
-    });
-
-    println!("  [i] launching video viewer …");
-    let status = Command::new("node")
-        .arg(&script)
-        .arg("--host")
-        .arg(session_state.ip.clone())
-        .arg("--port")
-        .arg(&data_port)
-        .arg("--key")
-        .arg(&session_key)
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .and_then(|mut c| c.wait())
-        .map_err(|e| format!("cannot start viewer (is Node installed?): {}", e))?;
-
-    stop.store(1, Ordering::Relaxed);
-    match status.code() {
-        Some(0) | None => Ok(()),
-        Some(c) => Err(format!("viewer exited with code {}", c)),
-    }
-}
-
-
-
-/// Serves the bootstrap channel while a GUI session runs: answers the host's
-/// PINGs with PONGs so the host keeps this session's data layer alive, and
-/// hangs up cleanly once the data link ends (`stop` set) or the socket dies.
-fn bootstrap_keepalive(
-    mut stream: std::net::TcpStream,
-    stop: Arc<AtomicU8>,
-) {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-    loop {
-        if stop.load(Ordering::Relaxed) == 1 {
-            break;
-        }
-        match proto::read_frame(&mut stream) {
-            Ok((PING, payload)) => {
-                if proto::write_frame(&mut stream, PONG, &payload).is_err() {
-                    return;
-                }
-            }
-            Ok((BYE, _)) => return,
-            Ok(_) => {}
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                continue;
-            }
-            Err(_) => return,
-        }
-    }
-    let _ = proto::write_frame(&mut stream, BYE, b"gui session ended");
+/// GUI viewer entry point. The video layer is currently broken / disabled
+/// across the framework, so this stub only reports that and refuses to start
+/// a session. Kept so the withdrawn egui viewer crate still type-checks.
+pub fn run_gui_session(
+    _target: &str,
+    _video_cb: Option<Box<dyn FnMut(&[u8]) + Send>>,
+    _audio_cb: Option<Box<dyn FnMut(&[u8]) + Send>>,
+) -> Result<(), String> {
+    eprintln!("  [video] video layer is BROKEN/DISABLED — GUI sessions are not supported (use the terminal REPL client instead)");
+    Err("video layer is broken/disabled".to_string())
 }
 
 /// one-shot download: auth, transfer, BYE — fully scriptable
@@ -692,6 +417,7 @@ pub fn run_session(target: &str, mode: RunMode) -> Result<(), String> {
     let dl_stop = Arc::new(AtomicU8::new(0));
     let xfer_status = Arc::new(AtomicU8::new(XFER_RUN));
     let (xfer_tx, xfer_rx) = mpsc::channel::<DlCommand>();
+    let (events_tx, events_rx) = mpsc::channel::<RemoteEvent>();
     
     // Spawn data link thread with reconnection logic
     let (ip_clone, data_port_clone, session_key_clone) = (ip.clone(), data_port.clone(), session_key.clone());
@@ -700,6 +426,7 @@ pub fn run_session(target: &str, mode: RunMode) -> Result<(), String> {
     let xfer_status_clone = Arc::clone(&xfer_status);
     let session_state_arc_clone = Arc::clone(&session_state_arc);
     let xfer_rx_clone = xfer_rx;
+    let events_tx_clone = events_tx;
     
     let dl_handle = std::thread::spawn(move || {
         data_link_with_reconnect(
@@ -710,8 +437,7 @@ pub fn run_session(target: &str, mode: RunMode) -> Result<(), String> {
             dl_stop_clone,
             xfer_rx_clone,
             Some(xfer_status_clone),
-            None, // video callback for shell mode
-            None, // audio callback for shell mode
+            Some(events_tx_clone),
             session_state_arc_clone,
         )
     });
@@ -737,12 +463,12 @@ pub fn run_session(target: &str, mode: RunMode) -> Result<(), String> {
     let input_running = Arc::new(AtomicBool::new(false));
     let mut input_handle: Option<std::thread::JoinHandle<()>> = None;
     if interactive && matches!(mode, RunMode::Shell) {
-        println!("  [i] remote terminal ready — type a command ('sudo <cmd>' for elevated, 'get'/'put' to transfer, 'input start/stop' to capture, 'exit' to quit)");
+        println!("  [i] remote terminal ready — ls/cd/pwd/mkdir/rm/mv, get/put, input start/stop, exit");
         print!("pyielink> ");
         let _ = std::io::stdout().flush();
     }
     let outcome =
-        post_auth_loop(&mut stream, interactive, &dl_state, &xfer_tx, &xfer_status, &mode, &input_running, &mut input_handle);
+        post_auth_loop(&mut stream, interactive, &dl_state, &xfer_tx, &xfer_status, &mode, &input_running, &mut input_handle, &events_rx);
     dl_stop.store(1, Ordering::Relaxed);
     let _ = dl_handle.join();
     outcome?;
@@ -832,16 +558,9 @@ fn data_link_connect(
     state: Arc<AtomicU8>,
     stop: Arc<AtomicU8>,
     cmds: &mpsc::Receiver<DlCommand>,
-    video_ctrl_rx: &mpsc::Receiver<DlCommand>,
+    events: Option<mpsc::Sender<RemoteEvent>>,
     status: Option<Arc<AtomicU8>>,
-    video_callback: &mut Option<Box<dyn FnMut(&[u8]) + Send>>,
-    audio_callback: &mut Option<Box<dyn FnMut(&[u8]) + Send>>,
     session_state: &Arc<std::sync::Mutex<SessionState>>,
-    monitor_index: u32,
-    offset_x: i32,
-    offset_y: i32,
-    width: u32,
-    height: u32,
 ) -> DlLinkResult {
     let dl_host = std::env::var("PYIELINK_DL_HOST").unwrap_or_else(|_| ip.to_string());
     let dl_port = std::env::var("PYIELINK_DL_PORT").unwrap_or_else(|_| port.to_string());
@@ -918,20 +637,6 @@ fn data_link_connect(
     }
     state.store(DL_UP, Ordering::Relaxed);
 
-    // Send video_start with monitor parameters
-    {
-        let video_start_msg = serde_json::json!({
-            "t": "video_start",
-            "monitor_index": monitor_index,
-            "offset_x": offset_x,
-            "offset_y": offset_y,
-            "width": width,
-            "height": height,
-        });
-        let json = video_start_msg.to_string();
-        let _ = ws.send(Message::Binary(dl_frame(DL_CH_VIDEO, json.as_bytes())));
-    }
-
     // control-channel heartbeat: answer server PINGs, send our own, log RTT
     // file-transfer state (Phase 3.1)
     let mut transfers: HashMap<u32, Active> = HashMap::new();
@@ -981,25 +686,8 @@ fn data_link_connect(
         }
     }
 
-    // Request video keyframe (IDR) on reconnect
-    {
-        let json = r#"{"t":"video_keyframe_request"}"#;
-        let _ = ws.send(Message::Binary(dl_frame(DL_CH_VIDEO, json.as_bytes())));
-    }
-
-    // Adaptive bitrate: bandwidth estimation variables
-    let mut last_bitrate_request = Instant::now();
-    let mut total_video_bytes: u64 = 0;
-    let mut bitrate_measurement_start = Instant::now();
-    let rtt_estimate: u128 = 50; // static estimate until adaptive rework
-    
     // control-channel heartbeat: answer server PINGs, send our own, log RTT
     let mut last_seen = Instant::now();
-    // file-transfer state (Phase 3.1)
-    let mut transfers: HashMap<u32, Active> = HashMap::new();
-    let mut next_id: u32 = 1;
-    let up_since = Instant::now();
-    static NO_VIDEO_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     loop {
         if stop.load(Ordering::Relaxed) == 1 {
@@ -1014,43 +702,6 @@ fn data_link_connect(
                 finish_oneshot(&status, false);
             }
         }
-        // Check for video control commands (pause/resume)
-        while let Ok(cmd) = video_ctrl_rx.try_recv() {
-            match cmd {
-                DlCommand::VideoPause => {
-                    let json = r#"{"t":"video_pause"}"#;
-                    let _ = ws.send(Message::Binary(dl_frame(DL_CH_VIDEO, json.as_bytes())));
-                    println!("  [video] stream paused (focus lost)");
-                }
-                DlCommand::VideoResume => {
-                    let json = r#"{"t":"video_resume"}"#;
-                    let _ = ws.send(Message::Binary(dl_frame(DL_CH_VIDEO, json.as_bytes())));
-                    println!("  [video] stream resumed (focus gained)");
-                }
-                _ => {}
-            }
-        }
-        
-        // Adaptive bitrate: only for video sessions (Shell has no video)
-        if video_callback.is_some() && last_bitrate_request.elapsed() >= BITRATE_REQUEST_INTERVAL {
-            let estimated_kbps = estimate_bandwidth_kbps(total_video_bytes, Instant::now() - bitrate_measurement_start, rtt_estimate);
-            let target_kbps = calculate_target_bitrate(estimated_kbps, rtt_estimate);
-            
-            let json = serde_json::json!({"t": "bitrate_request", "kbps": target_kbps}).to_string();
-            if ws.send(Message::Binary(dl_frame(DL_CH_VIDEO, json.as_bytes()))).is_err() {
-                eprintln!("  [adaptive] bitrate request send failed");
-            } else {
-                // Quiet in Shell REPL — video bitrate spam clobbers the prompt
-                if video_callback.is_some() {
-                    println!("  [adaptive] bitrate request: estimated={} kbps, target={} kbps, rtt={}ms", estimated_kbps, target_kbps, rtt_estimate);
-                }
-            }
-            last_bitrate_request = Instant::now();
-            // Reset measurement window
-            total_video_bytes = 0;
-            bitrate_measurement_start = Instant::now();
-        }
-        
         pump_puts(&mut ws, &mut transfers);
         match ws.read() {
             Ok(Message::Binary(buf)) => match dl_parse(&buf) {
@@ -1062,19 +713,8 @@ fn data_link_connect(
                         let _ = ws.send(Message::Binary(dl_frame(0x01, b"PONG")));
                     }
                 }
-                Some((DL_CH_META, payload)) => handle_meta_json(payload, &mut ws, &mut transfers, &status),
+                Some((DL_CH_META, payload)) => handle_meta_json(payload, &mut ws, &mut transfers, &status, &events),
                 Some((DL_CH_CHUNK, payload)) => handle_chunk(payload, &mut ws, &mut transfers, &status),
-                Some((DL_CH_VIDEO, payload)) => {
-                    total_video_bytes += payload.len() as u64;
-                    if let Some(cb) = video_callback.as_mut() {
-                        cb(payload);
-                    }
-                }
-                Some((DL_CH_AUDIO, payload)) => {
-                    if let Some(cb) = audio_callback.as_mut() {
-                        cb(payload);
-                    }
-                }
                 _ => {} // unknown channel: drop silently (mirrors mux policy)
             },
             Ok(Message::Close(_)) | Ok(Message::Frame(_)) => {
@@ -1088,15 +728,6 @@ fn data_link_connect(
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    if video_callback.is_some()
-                        && total_video_bytes == 0
-                        && up_since.elapsed() >= Duration::from_secs(8)
-                        && !NO_VIDEO_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
-                        eprintln!(
-                            "[video] connected but no video frames arriving — host encoder or stream path is failing"
-                        );
-                    }
                 if last_seen.elapsed() >= DL_STALE {
                     eprintln!("  [dl-link] data layer stopped responding — tearing down");
                     state.store(DL_DEAD, Ordering::Relaxed);
@@ -1177,20 +808,14 @@ fn data_link_with_reconnect(
     stop: Arc<AtomicU8>,
     cmds: mpsc::Receiver<DlCommand>,
     status: Option<Arc<AtomicU8>>,
-    _video_callback: Option<Box<dyn FnMut(&[u8]) + Send>>,
-    _audio_callback: Option<Box<dyn FnMut(&[u8]) + Send>>,
+    events: Option<mpsc::Sender<RemoteEvent>>,
     session_state: Arc<std::sync::Mutex<SessionState>>,
 ) {
     let mut reconnect_attempts = 0u32;
-    let (_, video_ctrl_rx) = mpsc::channel::<DlCommand>(); // unused in shell mode
     loop {
         if stop.load(Ordering::Relaxed) == 1 {
             return;
         }
-        
-        // Shell mode doesn't use video/audio callback
-        let mut video_cb: Option<Box<dyn FnMut(&[u8]) + Send>> = None;
-        let mut audio_cb: Option<Box<dyn FnMut(&[u8]) + Send>> = None;
         let result = data_link_connect(
             ip,
             port,
@@ -1198,16 +823,9 @@ fn data_link_with_reconnect(
             Arc::clone(&state),
             Arc::clone(&stop),
             &cmds,
-            &video_ctrl_rx,
+            events.clone(),
             status.clone(),
-            &mut video_cb,
-            &mut audio_cb,
             &session_state,
-            0, // monitor_index
-            0, // offset_x
-            0, // offset_y
-            0, // width
-            0, // height
         );
         
         match result {
@@ -1255,62 +873,6 @@ fn finish_oneshot(status: &Option<Arc<AtomicU8>>, ok: bool) {
 fn send_meta_json(ws: &mut WebSocket<TcpStream>, json: String) -> Result<(), String> {
     ws.send(Message::Binary(dl_frame(DL_CH_META, json.as_bytes())))
         .map_err(|e| format!("meta send failed: {}", e))
-}
-
-/// REPL verbs: `get <remote> [local]` / `put <local> [remote]`
-fn handle_xfer_verb(line: &str, tx: &mpsc::Sender<DlCommand>) {
-    let mut it = line.split_whitespace();
-    let verb = it.next().unwrap_or("");
-    let rest: Vec<&str> = it.collect();
-    let cmd = match (verb, rest.len()) {
-        ("get", 1) => Some(DlCommand::Get {
-            remote: rest[0].to_string(),
-            local: PathBuf::from(basename_of(rest[0])),
-        }),
-        ("get", 2) => Some(DlCommand::Get {
-            remote: rest[0].to_string(),
-            local: PathBuf::from(rest[1]),
-        }),
-        ("put", 1) => {
-            if std::path::Path::new(rest[0]).is_file() {
-                Some(DlCommand::Put {
-                    local: PathBuf::from(rest[0]),
-                    remote: basename_of(rest[0]).to_string(),
-                })
-            } else {
-                println!("  [xfer] no such file: {}", rest[0]);
-                None
-            }
-        }
-        ("put", 2) => {
-            if std::path::Path::new(rest[0]).is_file() {
-                Some(DlCommand::Put {
-                    local: PathBuf::from(rest[0]),
-                    remote: rest[1].to_string(),
-                })
-            } else {
-                println!("  [xfer] no such file: {}", rest[0]);
-                None
-            }
-        }
-        _ => None,
-    };
-    match cmd {
-        Some(c) => {
-            if tx.send(c).is_err() {
-                println!("  [xfer] data link not available");
-            } else {
-                println!("  [xfer] queued.");
-            }
-        }
-        None => {
-            if verb == "get" || verb == "put" {
-                println!("  [i] usage: {} <file> [destination]", verb);
-            } else {
-                println!("  [i] usage: get <remote> [local] | put <local> [remote]");
-            }
-        }
-    }
 }
 
 fn handle_input_verb(
@@ -1465,18 +1027,49 @@ fn start_cmd(
             println!("  [input] capture stopped");
             Ok(())
         }
-        DlCommand::VideoPause => {
-            let json = r#"{"t":"video_pause"}"#;
-            ws.send(Message::Binary(dl_frame(DL_CH_VIDEO, json.as_bytes())))
-                .map_err(|e| format!("send video pause: {}", e))?;
-            println!("  [video] stream paused");
-            Ok(())
+        DlCommand::ListDir { path } => send_meta_json(
+            ws,
+            format!("{{\"t\":\"readdir\",\"id\":{},\"path\":\"{}\"}}", *next_id, json_escape(&path)),
+        )
+        .map(|_| {
+            *next_id += 1;
+        }),
+        DlCommand::CreateDir { path } => {
+            let id = *next_id;
+            *next_id += 1;
+            send_meta_json(ws, format!("{{\"t\":\"mkdir\",\"id\":{},\"path\":\"{}\"}}", id, json_escape(&path)))
         }
-        DlCommand::VideoResume => {
-            let json = r#"{"t":"video_resume"}"#;
-            ws.send(Message::Binary(dl_frame(DL_CH_VIDEO, json.as_bytes())))
-                .map_err(|e| format!("send video resume: {}", e))?;
-            println!("  [video] stream resumed");
+        DlCommand::Delete { path, recursive } => {
+            let id = *next_id;
+            *next_id += 1;
+            send_meta_json(
+                ws,
+                format!(
+                    "{{\"t\":\"delete\",\"id\":{},\"path\":\"{}\",\"recursive\":{}}}",
+                    id,
+                    json_escape(&path),
+                    recursive
+                ),
+            )
+        }
+        DlCommand::Rename { old, new } => {
+            let id = *next_id;
+            *next_id += 1;
+            send_meta_json(
+                ws,
+                format!(
+                    "{{\"t\":\"rename\",\"id\":{},\"old\":\"{}\",\"new\":\"{}\"}}",
+                    id,
+                    json_escape(&old),
+                    json_escape(&new)
+                ),
+            )
+        }
+        // Video layer is broken/disabled framework-wide. These arms exist only
+        // so the withdrawn egui viewer crate keeps compiling; they print a
+        // notice and do nothing.
+        DlCommand::VideoPause | DlCommand::VideoResume => {
+            eprintln!("  [video] video layer is BROKEN/DISABLED — ignoring control command");
             Ok(())
         }
     }
@@ -1563,6 +1156,7 @@ fn handle_meta_json(
     ws: &mut WebSocket<TcpStream>,
     transfers: &mut HashMap<u32, Active>,
     status: &Option<Arc<AtomicU8>>,
+    events: &Option<mpsc::Sender<RemoteEvent>>,
 ) {
     let json = String::from_utf8_lossy(payload);
     let t = match jstr(&json, "t") {
@@ -1676,9 +1270,60 @@ fn handle_meta_json(
         "error" => {
             let code = jstr(&json, "code").unwrap_or_default();
             let msg = jstr(&json, "msg").unwrap_or_default();
+            // op responses come back with an `op` field; transfer errors don't
+            if let Some(op) = jstr(&json, "op") {
+                if let Some(tx) = events {
+                    let _ = tx.send(RemoteEvent::OpResult {
+                        op: op.to_string(),
+                        ok: false,
+                        msg: format!("[{}] {}", code, msg),
+                    });
+                }
+                return;
+            }
             if let Some(a) = transfers.remove(&id) {
                 println!("  [xfer] FAILED '{}': [{}] {}", a.label(), code, msg);
                 finish_oneshot(status, false);
+            }
+        }
+        // ---- remote file-explorer ops (datalayer files.js) ----
+        "dir" => {
+            if let Some(tx) = events {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+                let mut entries = Vec::new();
+                if let Some(arr) = parsed.get("entries").and_then(|v| v.as_array()) {
+                    for e in arr {
+                        entries.push(DirEntry {
+                            name: e.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            is_dir: e.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false),
+                            size: e.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+                            mtime: e.get("mtime").and_then(|v| v.as_u64()),
+                        });
+                    }
+                }
+                let _ = tx.send(RemoteEvent::DirListing(DirListing {
+                    path: parsed
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    entries,
+                }));
+            }
+        }
+        "mkdir_ok" | "delete_ok" | "rename_ok" => {
+            let op = match t.as_str() {
+                "mkdir_ok" => "mkdir",
+                "delete_ok" => "delete",
+                _ => "rename",
+            };
+            if let Some(tx) = events {
+                let _ = tx.send(RemoteEvent::OpResult {
+                    op: op.to_string(),
+                    ok: true,
+                    msg: String::new(),
+                });
             }
         }
         _ => {}
@@ -1749,6 +1394,70 @@ fn handle_chunk(
     }
 }
 
+/// Normalize a remote-cwd path relative to root. Clamps `..` at the root.
+fn normalize_remote(cwd: &str, arg: &str) -> String {
+    let joined = if arg.starts_with('/') || arg.contains(':') || arg == "." {
+        arg.to_string()
+    } else {
+        format!("{}/{}", cwd.trim_end_matches('/'), arg)
+    };
+    let parts: Vec<&str> = joined.split('/').filter(|s| !s.is_empty() && *s != ".").collect();
+    let mut out: Vec<&str> = Vec::new();
+    for seg in &parts {
+        if *seg == ".." {
+            out.pop();
+        } else {
+            out.push(seg);
+        }
+    }
+    let result = out.join("/");
+    if result.is_empty() { ".".to_string() } else { result }
+}
+
+/// Join a remote cwd with a relative path for transfer ops.
+fn resolve_remote(cwd: &str, arg: &str) -> String {
+    if arg.starts_with('/') || arg.contains(':') || arg == "." {
+        arg.to_string()
+    } else {
+        let base = cwd.trim_end_matches('/');
+        if base.is_empty() || base == "." {
+            arg.to_string()
+        } else {
+            format!("{}/{}", base, arg)
+        }
+    }
+}
+
+/// Format a directory listing for display.
+fn print_dir_listing(listing: &DirListing) {
+    println!("  remote [{}]", listing.path);
+    for e in &listing.entries {
+        if e.is_dir {
+            println!("    {:<20}  <DIR>", e.name);
+        } else {
+            println!("    {:<20}  {} bytes", e.name, e.size);
+        }
+    }
+}
+
+/// Drain and print all pending remote events (non-blocking).
+fn drain_events(rx: &mpsc::Receiver<RemoteEvent>) {
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            RemoteEvent::DirListing(listing) => print_dir_listing(&listing),
+            RemoteEvent::OpResult { op, ok, msg } => {
+                if ok {
+                    println!("  [remote] {} ok", op);
+                } else if !msg.is_empty() {
+                    println!("  [remote] {} FAILED: {}", op, msg);
+                } else {
+                    println!("  [remote] {} FAILED", op);
+                }
+            }
+        }
+    }
+}
+
 /// Root channel: answers host pings, streams remote-command output, and in
 /// interactive mode feeds typed lines to the host's terminal channel.
 fn post_auth_loop(
@@ -1760,13 +1469,17 @@ fn post_auth_loop(
     mode: &RunMode,
     input_running: &Arc<AtomicBool>,
     input_handle: &mut Option<std::thread::JoinHandle<()>>,
+    events_rx: &mpsc::Receiver<RemoteEvent>,
 ) -> Result<(), String> {
     let mut stdin_rx = if interactive { Some(spawn_stdin_reader()) } else { None };
     let mut stdin_done = false;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
     let mut last_ping_seen = Instant::now();
     let mut awaiting_result = false;
+    let mut remote_cwd = String::from(".");
     loop {
+        // drain remote events (dir listings, mkdir/delete/rename results)
+        drain_events(events_rx);
         if let Some(rx) = &stdin_rx {
             while let Ok(m) = rx.try_recv() {
                 match m {
@@ -1799,15 +1512,132 @@ fn post_auth_loop(
                             println!("  [bye] closing session.");
                             return Ok(());
                         }
-                        // file-transfer verbs ride the ws data link
-                        if l == "get" || l.starts_with("get ") {
-                            handle_xfer_verb(l, xfer_tx);
+                        // ---- remote file-explorer verbs ----
+                        if l == "pwd" {
+                            println!("  {}", remote_cwd);
                             print!("pyielink> ");
                             let _ = std::io::stdout().flush();
                             continue;
                         }
-                        if l == "put" || l.starts_with("put ") {
-                            handle_xfer_verb(l, xfer_tx);
+                        if let Some(arg) = l.strip_prefix("cd ") {
+                            remote_cwd = normalize_remote(&remote_cwd, arg.trim());
+                            print!("pyielink> ");
+                            let _ = std::io::stdout().flush();
+                            continue;
+                        }
+                        if l == "cd" || l == "cd ~" || l == "cd ." {
+                            remote_cwd = ".".to_string();
+                            print!("pyielink> ");
+                            let _ = std::io::stdout().flush();
+                            continue;
+                        }
+                        if l == "ls" || l == "ll" || l.starts_with("ls ") || l.starts_with("ll ") {
+                            let arg = l.split_whitespace().nth(1).unwrap_or(".");
+                            let resolved = normalize_remote(&remote_cwd, arg);
+                            let _ = xfer_tx.send(DlCommand::ListDir { path: resolved });
+                            print!("pyielink> ");
+                            let _ = std::io::stdout().flush();
+                            continue;
+                        }
+                        if let Some(arg) = l.strip_prefix("mkdir ") {
+                            let resolved = resolve_remote(&remote_cwd, arg.trim());
+                            let _ = xfer_tx.send(DlCommand::CreateDir { path: resolved });
+                            print!("pyielink> ");
+                            let _ = std::io::stdout().flush();
+                            continue;
+                        }
+                        if let Some(arg) = l.strip_prefix("rm ") {
+                            let resolved = resolve_remote(&remote_cwd, arg.trim());
+                            let _ = xfer_tx.send(DlCommand::Delete { path: resolved, recursive: false });
+                            print!("pyielink> ");
+                            let _ = std::io::stdout().flush();
+                            continue;
+                        }
+                        if let Some(arg) = l.strip_prefix("rmdir ") {
+                            let resolved = resolve_remote(&remote_cwd, arg.trim());
+                            let _ = xfer_tx.send(DlCommand::Delete { path: resolved, recursive: true });
+                            print!("pyielink> ");
+                            let _ = std::io::stdout().flush();
+                            continue;
+                        }
+                        if let Some(arg) = l.strip_prefix("del ") {
+                            let resolved = resolve_remote(&remote_cwd, arg.trim());
+                            let _ = xfer_tx.send(DlCommand::Delete { path: resolved, recursive: true });
+                            print!("pyielink> ");
+                            let _ = std::io::stdout().flush();
+                            continue;
+                        }
+                        if let Some(arg) = l.strip_prefix("mv ") {
+                            let parts: Vec<&str> = arg.splitn(2, |c| c == ' ' || c == '\t').collect();
+                            if parts.len() == 2 {
+                                let from = resolve_remote(&remote_cwd, parts[0].trim());
+                                let to   = resolve_remote(&remote_cwd, parts[1].trim());
+                                let _ = xfer_tx.send(DlCommand::Rename { old: from, new: to });
+                            } else {
+                                println!("  [i] usage: mv <source> <dest>");
+                            }
+                            print!("pyielink> ");
+                            let _ = std::io::stdout().flush();
+                            continue;
+                        }
+                        if let Some(arg) = l.strip_prefix("rename ") {
+                            let parts: Vec<&str> = arg.splitn(2, |c| c == ' ' || c == '\t').collect();
+                            if parts.len() == 2 {
+                                let from = resolve_remote(&remote_cwd, parts[0].trim());
+                                let to   = resolve_remote(&remote_cwd, parts[1].trim());
+                                let _ = xfer_tx.send(DlCommand::Rename { old: from, new: to });
+                            } else {
+                                println!("  [i] usage: rename <source> <dest>");
+                            }
+                            print!("pyielink> ");
+                            let _ = std::io::stdout().flush();
+                            continue;
+                        }
+                        // ---- transfer verbs (with remote-cwd resolution) ----
+                        if l.starts_with("get ") {
+                            let arg = l.strip_prefix("get ").unwrap_or("");
+                            let mut it = arg.splitn(2, |c| c == ' ' || c == '\t');
+                            let remote_arg = it.next().unwrap_or("").trim();
+                            let local_arg = it.next().map(|s| s.trim()).unwrap_or("");
+                            let local = if local_arg.is_empty() {
+                                std::path::PathBuf::from(basename_of(remote_arg))
+                            } else {
+                                std::path::PathBuf::from(local_arg)
+                            };
+                            let resolved = resolve_remote(&remote_cwd, remote_arg);
+                            let _ = xfer_tx.send(DlCommand::Get { remote: resolved, local });
+                            println!("  [xfer] queued.");
+                            print!("pyielink> ");
+                            let _ = std::io::stdout().flush();
+                            continue;
+                        }
+                        if l == "get" {
+                            println!("  [i] usage: get <remote> [local]");
+                            print!("pyielink> ");
+                            let _ = std::io::stdout().flush();
+                            continue;
+                        }
+                        if l.starts_with("put ") {
+                            let arg = l.strip_prefix("put ").unwrap_or("");
+                            let mut it = arg.splitn(2, |c| c == ' ' || c == '\t');
+                            let local_str = it.next().unwrap_or("");
+                            let remote_str = it.next().unwrap_or(local_str);
+                            if std::path::Path::new(local_str).is_file() {
+                                let resolved = resolve_remote(&remote_cwd, remote_str);
+                                let _ = xfer_tx.send(DlCommand::Put {
+                                    local: std::path::PathBuf::from(local_str),
+                                    remote: resolved,
+                                });
+                                println!("  [xfer] queued.");
+                            } else {
+                                println!("  [xfer] no such file: {}", local_str);
+                            }
+                            print!("pyielink> ");
+                            let _ = std::io::stdout().flush();
+                            continue;
+                        }
+                        if l == "put" {
+                            println!("  [i] usage: put <local> [remote]");
                             print!("pyielink> ");
                             let _ = std::io::stdout().flush();
                             continue;
@@ -1933,7 +1763,8 @@ fn confirm_license() -> bool {
         print!("\naccept agreement? [y/n]: ");
         let _ = std::io::stdout().flush();
         let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_err() {
+        // EOF (piped/closed stdin) must fail fast, not spin forever.
+        if std::io::stdin().read_line(&mut line).is_err() || line.is_empty() {
             return false;
         }
         match line.trim().to_ascii_lowercase().as_str() {
@@ -1950,37 +1781,6 @@ fn local_hint(ip: &str) -> Option<String> {
     let s = UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect((ip, BOOTSTRAP_PORT)).ok()?;
     s.local_addr().ok().map(|a| a.to_string())
-}
-
-/// Estimate bandwidth in kbps based on received video bytes, elapsed time, and RTT.
-fn estimate_bandwidth_kbps(bytes: u64, elapsed: Duration, rtt_ms: u128) -> u32 {
-    if elapsed.as_secs_f64() < 0.1 {
-        return 5000; // default conservative estimate
-    }
-    let bytes_per_sec = bytes as f64 / elapsed.as_secs_f64();
-    let kbps = (bytes_per_sec * 8.0 / 1000.0) as u32;
-    
-    // Adjust for RTT: higher RTT means more conservative estimate
-    let rtt_factor = if rtt_ms > 100 { 0.7 } else if rtt_ms > 50 { 0.85 } else { 1.0 };
-    let adjusted = (kbps as f64 * rtt_factor) as u32;
-    
-    adjusted.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS)
-}
-
-/// Calculate target bitrate based on estimated bandwidth and RTT.
-/// Uses a conservative approach to maintain low latency.
-fn calculate_target_bitrate(estimated_kbps: u32, rtt_ms: u128) -> u32 {
-    // Leave headroom for latency: use 80% of estimated bandwidth
-    let mut target = (estimated_kbps as f64 * 0.8) as u32;
-    
-    // Further reduce for high RTT to prevent buffer bloat
-    if rtt_ms > 150 {
-        target = (target as f64 * 0.7) as u32;
-    } else if rtt_ms > 100 {
-        target = (target as f64 * 0.85) as u32;
-    }
-    
-    target.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS)
 }
 
 #[cfg(test)]

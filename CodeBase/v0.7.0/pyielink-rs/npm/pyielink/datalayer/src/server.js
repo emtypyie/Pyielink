@@ -141,8 +141,9 @@ wss.on("connection", (ws) => {
     const svcLog = (m) => { flog(m); console.log(m); };
     const files = new FileService(mux, session, svcLog);
     const input = new InputService(mux, session, svcLog);
-    const video = new VideoService(mux, session, svcLog);
-    const audio = new AudioService(mux, session, svcLog);
+    const mediaEnabled = process.env.PYIELINK_MEDIA === "1";
+    const video = mediaEnabled ? new VideoService(mux, session, svcLog) : null;
+    const audio = mediaEnabled ? new AudioService(mux, session, svcLog) : null;
     hb.start();
     if (process.env.PYIELINK_TRANSPORT !== "tcp") {
       startHostRtc({ mux, onSignal: sendSignal, log: (m) => flog(m) })
@@ -156,8 +157,8 @@ wss.on("connection", (ws) => {
       }
       files.teardownAll();
       input.stop();
-      video.stop();
-      audio.stop();
+      if (video) video.stop();
+      if (audio) audio.stop();
       console.log(`[pyielink-dl] client disconnected (code ${code})`);
     });
   });

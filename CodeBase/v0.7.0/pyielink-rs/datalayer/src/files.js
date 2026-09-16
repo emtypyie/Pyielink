@@ -5,7 +5,10 @@ import {
   createWriteStream,
   existsSync,
   mkdirSync,
+  readdirSync,
   renameSync,
+  rmSync,
+  rmdirSync,
   statSync,
   unlinkSync,
 } from "node:fs";
@@ -62,28 +65,40 @@ export class FileService {
     this.log(`[files] transfer ${id} aborted (${x.dir} ${x.name})`);
   }
 
+  /// Resolve a *relative* name against the landing root, guaranteeing the
+  /// result stays inside it (defense in depth against path tricks).
+  _insideLanding(rel) {
+    const clean = path.normalize(String(rel || ".")).replace(/^[/\\]+/, "");
+    const abs = path.join(this.landing, clean);
+    const root = path.normalize(this.landing);
+    return abs === root || abs.startsWith(root + path.sep) ? abs : null;
+  }
+
   // resolve a requested host-side path against the role sandbox:
   // standard users are locked to the landing dir; admins may use any
-  // absolute path. Relative names always land in the sandbox root.
+  // absolute path. Relative names that nest (e.g. "docs/notes.txt")
+  // resolve inside the landing root so a remote file explorer can walk
+  // the whole sandbox.
   _resolveTarget(name) {
     const requested = String(name || "").trim();
     if (!requested) return { err: "empty path" };
     const absolute = path.isAbsolute(requested) || /^[a-zA-Z]:/.test(requested);
     if (this.session.role !== "admin") {
       if (absolute || requested.split(/[\\/]/).includes("..")) {
-        return { err: "standard users may only write inside their home landing folder" };
+        return { err: "standard users may only access their home landing folder" };
       }
-      const base = safeBaseName(requested);
-      if (!base) return { err: "invalid file name" };
-      return { abs: path.join(this.landing, base) };
+      const abs = this._insideLanding(requested);
+      if (!abs) return { err: "path escapes home landing folder" };
+      if (!safeBaseName(abs)) return { err: "invalid file name" };
+      return { abs };
     }
     let candidate;
     if (absolute) {
       candidate = path.normalize(requested);
     } else {
-      const base = safeBaseName(requested);
-      if (!base) return { err: "invalid file name" };
-      candidate = path.join(this.landing, base);
+      const abs = this._insideLanding(requested);
+      if (!abs) return { err: "path escapes landing root" };
+      candidate = abs;
     }
     const parsed = path.parse(candidate);
     for (const seg of parsed.dir.slice(parsed.root.length).split(path.sep)) {
@@ -91,6 +106,141 @@ export class FileService {
     }
     if (!parsed.base || /[<>:"|?*\u0000]/.test(parsed.base)) return { err: "invalid file name" };
     return { abs: candidate };
+  }
+
+  /// Resolve a directory-ish path for browse/create/delete/rename. "." (or "")
+  /// is the landing / home root. Same role sandbox as _resolveTarget, plus
+  /// `_opError` keeps op error replies distinct from transfer errors.
+  _resolveDir(name) {
+    const requested = String(name || "").trim();
+    if (this.session.role !== "admin") {
+      if (requested.split(/[\\/]/).includes("..")) {
+        return { err: "standard users may only access their home landing folder" };
+      }
+      const abs = this._insideLanding(requested === "" ? "." : requested);
+      if (!abs) return { err: "path escapes home landing folder" };
+      return { abs };
+    }
+    if (requested === "") return { abs: path.normalize(this.landing) };
+    let candidate;
+    if (/^[a-zA-Z]:/.test(requested) || path.isAbsolute(requested)) {
+      candidate = path.normalize(requested);
+    } else {
+      const abs = this._insideLanding(requested);
+      if (!abs) return { err: "path escapes landing root" };
+      candidate = abs;
+    }
+    for (const seg of candidate.split(/[\\/]+/)) {
+      if (seg === "..") return { err: "path traversal rejected" };
+    }
+    return { abs: candidate };
+  }
+
+  _opError(id, op, code, msg) {
+    this._sendMeta({ t: "error", id, op, code, msg });
+  }
+
+  _readdir({ id, path: dirPath }) {
+    const target = this._resolveDir(dirPath);
+    if (target.err) return this._opError(id, "readdir", "denied", target.err);
+    let st;
+    try {
+      st = statSync(target.abs);
+    } catch {
+      return this._opError(id, "readdir", "notfound", `no such directory: ${dirPath}`);
+    }
+    if (!st.isDirectory()) {
+      return this._opError(id, "readdir", "notdir", `not a directory: ${dirPath}`);
+    }
+    let names;
+    try {
+      names = readdirSync(target.abs);
+    } catch (e) {
+      return this._opError(id, "readdir", "io", `cannot list: ${e.message}`);
+    }
+    const entries = [];
+    for (const name of names) {
+      const full = path.join(target.abs, name);
+      try {
+        const s = statSync(full);
+        entries.push({
+          name,
+          is_dir: s.isDirectory(),
+          size: s.size,
+          mtime: Math.floor(s.mtimeMs),
+        });
+      } catch {}
+    }
+    entries.sort((a, b) =>
+      a.is_dir === b.is_dir ? a.name.localeCompare(b.name) : a.is_dir ? -1 : 1
+    );
+    this._sendMeta({ t: "dir", id, path: dirPath, entries });
+    this.log(`[files] readdir ${target.abs} (${entries.length} entries) (${this.session.user})`);
+  }
+
+  _mkdir({ id, path: dirPath }) {
+    const target = this._resolveDir(dirPath);
+    if (target.err) return this._opError(id, "mkdir", "denied", target.err);
+    try {
+      mkdirSync(target.abs, { recursive: true });
+    } catch (e) {
+      return this._opError(id, "mkdir", "io", `cannot create: ${e.message}`);
+    }
+    this._sendMeta({ t: "mkdir_ok", id });
+    this.log(`[files] mkdir ${target.abs} (${this.session.user})`);
+  }
+
+  _delete({ id, path: delPath, recursive }) {
+    const target = this._resolveDir(delPath);
+    if (target.err) return this._opError(id, "delete", "denied", target.err);
+    if (
+      this.session.role !== "admin" &&
+      path.normalize(target.abs) === path.normalize(this.landing)
+    ) {
+      return this._opError(id, "delete", "denied", "cannot delete your landing root");
+    }
+    let st;
+    try {
+      st = statSync(target.abs);
+    } catch {
+      return this._opError(id, "delete", "notfound", `no such file or directory: ${delPath}`);
+    }
+    try {
+      if (st.isDirectory()) {
+        if (recursive) {
+          rmSync(target.abs, { recursive: true, force: true });
+        } else {
+          try {
+            rmdirSync(target.abs);
+          } catch {
+            return this._opError(id, "delete", "notempty", "directory not empty (use `rm -r`)");
+          }
+        }
+      } else {
+        rmSync(target.abs, { force: true });
+      }
+    } catch (e) {
+      return this._opError(id, "delete", "io", `cannot delete: ${e.message}`);
+    }
+    this._sendMeta({ t: "delete_ok", id });
+    this.log(`[files] delete ${target.abs} (recursive=${!!recursive}) (${this.session.user})`);
+  }
+
+  _rename({ id, old: oldPath, new: newPath }) {
+    const from = this._resolveDir(oldPath);
+    if (from.err) return this._opError(id, "rename", "denied", from.err);
+    const to = this._resolveTarget(newPath);
+    if (to.err) return this._opError(id, "rename", "denied", to.err);
+    if (path.normalize(from.abs) === path.normalize(to.abs)) {
+      return this._opError(id, "rename", "bad", "source and destination are the same");
+    }
+    try {
+      renameSync(from.abs, to.abs);
+    } catch (e) {
+      return this._opError(id, "rename", "io", `cannot rename: ${e.message}`);
+    }
+    this._sendMeta({ t: "rename_ok", id });
+    this.log(`[files] rename ${from.abs} -> ${to.abs} (${this.session.user})`);
   }
 
   _meta(payload) {
@@ -102,6 +252,10 @@ export class FileService {
     }
     if (msg.t === "pull") return this._pull(msg);
     if (msg.t === "push") return this._push(msg);
+    if (msg.t === "readdir") return this._readdir(msg);
+    if (msg.t === "mkdir") return this._mkdir(msg);
+    if (msg.t === "delete") return this._delete(msg);
+    if (msg.t === "rename") return this._rename(msg);
     if (msg.t === "eof") {
       // client finished streaming its push; required for zero-byte files
       // where no FILE_CHUNK ever arrives to trigger completion

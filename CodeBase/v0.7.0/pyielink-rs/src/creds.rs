@@ -797,6 +797,24 @@ mod tests {
 
     #[test]
     fn seal_unseal_round_trip() {
+        // seal/unseal read the master key from <PYIELINK_HOME>/host.key, so
+        // the test must not depend on a real ~/.pyielink existing (Windows dev
+        // boxes have one, clean Linux hosts do not). Point PYIELINK_HOME at a
+        // unique temp dir and initialize a fresh key instead.
+        let dir = std::env::temp_dir().join(format!(
+            "pyielink-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // SAFETY: env mutation is unsafe since edition 2024. No other test
+        // reads PYIELINK_HOME, and the dir is unique per invocation, so there
+        // is no cross-test interference.
+        unsafe { std::env::set_var("PYIELINK_HOME", &dir) };
+        init_key().unwrap();
+
         let json = r#"{ "enabled": true, "users": { "x": { "pw_salt": "aa" } } }"#;
         let sealed = seal_state(json).unwrap();
         assert!(sealed.starts_with(ENC_MAGIC));
@@ -806,5 +824,9 @@ mod tests {
         let mut bad = sealed.clone();
         bad.replace_range(30..32, "zz");
         assert!(unseal_state(&bad).is_none());
+
+        // SAFETY: restores the environment for any later tests in this process.
+        unsafe { std::env::remove_var("PYIELINK_HOME") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,9 +1,11 @@
 #!/bin/sh
 # PYIELINK FRAMEWORK container entrypoint
-# Mode is the first argument: host | view  (defaults to host).
+# Mode is the first argument: host | client  (defaults to host).
 #
-# host: starts the data layer that captures + streams this machine's screen.
-# view: connects to a host and opens the screen in ffplay (Xvfb if headless).
+# host: starts the data layer (file/input services; video/audio gated by
+#       PYIELINK_MEDIA=1).
+# client: connects to a host and opens the interactive terminal + file
+#       explorer REPL (native Rust client; a desktop GUI is no longer shipped).
 #
 # Settings are read from the mounted explicit config file /app/pyielink.conf,
 # then overridden by any matching environment variables (e.g. -e PYIELINK_HOST).
@@ -41,23 +43,17 @@ case "$MODE" in
         HANDOFF=$(mktemp)
         printf '%s\nuser\nuser\n' "$KEY" > "$HANDOFF"
         echo "[pyielink] HOST mode — session key: $KEY"
-        echo "[pyielink] streaming on ws://0.0.0.0:${PORT}"
+        echo "[pyielink] data layer on ws://0.0.0.0:${PORT}"
         PYIELINK_SESSION="$HANDOFF" PYIELINK_DL_PORT="$PORT" \
             exec node /app/datalayer/src/server.js --port "$PORT"
         ;;
-    view)
-        KEY=$(gen_key)
-        : "${PYIELINK_HOST:?set PYIELINK_HOST=<host-ip> in pyielink.conf or pass -e PYIELINK_HOST=<host-ip> view}"
-        if [ -z "$DISPLAY" ]; then
-            Xvfb :99 -screen 0 1280x720x24 >/dev/null 2>&1 &
-            export DISPLAY=:99
-        fi
-        echo "[pyielink] VIEW mode — connecting to $PYIELINK_HOST:${PORT}"
-        exec node /app/datalayer/src/client_view.js \
-            --host "$PYIELINK_HOST" --port "$PORT" --key "$KEY"
+    client)
+        : "${PYIELINK_HOST:?set PYIELINK_HOST=<host-ip> in pyielink.conf or pass -e PYIELINK_HOST=<host-ip> client}"
+        echo "[pyielink] CLIENT mode — connecting to $PYIELINK_HOST"
+        exec /app/pyielink "$PYIELINK_USER@$PYIELINK_HOST"
         ;;
     *)
-        echo "usage: entrypoint.sh [host|view]" >&2
+        echo "usage: entrypoint.sh [host|client]" >&2
         exit 1
         ;;
 esac
