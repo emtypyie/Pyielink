@@ -1,5 +1,7 @@
 pub mod client;
 pub mod creds;
+#[cfg(feature = "gui")]
+pub mod gui;
 pub mod host;
 pub mod input;
 pub mod proto;

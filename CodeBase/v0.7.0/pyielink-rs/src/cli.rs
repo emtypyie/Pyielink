@@ -15,6 +15,8 @@ fn print_usage() {
     eprintln!();
     eprintln!("commands:");
     eprintln!("  user@ip                   Connect to host (interactive terminal REPL)");
+    eprintln!("  user@ip explorer          Open the file-explorer GUI (needs 'gui' feature)");
+    eprintln!("  user@ip explorer --repl   File-explorer terminal session (same as the REPL)");
     eprintln!("  --repl user@ip            Same as above (legacy flag, ignored)");
     eprintln!("  enable                  Enable host for connections");
     eprintln!("  enable --all             Enable host for connections from any IP");
@@ -65,6 +67,34 @@ fn main() {
     }
 
     let command = &args[0];
+
+    // `pyielink user@ip explorer [--repl]` — file-explorer front-end.
+    // `--repl`/`--rptl` = terminal sessions only; plain `explorer` opens the GUI.
+    if args.len() >= 2 && command.contains('@') && args[1] == "explorer" {
+        let target = &args[0];
+        let repl = args.iter().skip(2).any(|a| a == "--repl" || a == "--rptl");
+        if repl {
+            if let Err(e) = pyielink::client::run_connect(target, true) {
+                eprintln!("  [error] connection failed: {}", e);
+                process::exit(1);
+            }
+            return;
+        }
+        #[cfg(feature = "gui")]
+        {
+            if let Err(e) = pyielink::gui::run_explorer(target) {
+                eprintln!("  [error] explorer: {}", e);
+                process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "gui"))]
+        {
+            eprintln!("  [error] the GUI explorer is not built into this binary.");
+            eprintln!("  [error] rebuild with `cargo build --features gui` or use `{} explorer --repl` for the terminal explorer.", target);
+            process::exit(1);
+        }
+    }
 
     match command.as_str() {
         "enable" => {

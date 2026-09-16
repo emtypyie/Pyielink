@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   copyFileSync,
+  cpSync,
   createReadStream,
   createWriteStream,
   existsSync,
@@ -243,6 +244,33 @@ export class FileService {
     this.log(`[files] rename ${from.abs} -> ${to.abs} (${this.session.user})`);
   }
 
+  _copy({ id, from: fromPath, to: toPath }) {
+    const from = this._resolveDir(fromPath);
+    if (from.err) return this._opError(id, "copy", "denied", from.err);
+    const to = this._resolveTarget(toPath);
+    if (to.err) return this._opError(id, "copy", "denied", to.err);
+    if (path.normalize(from.abs) === path.normalize(to.abs)) {
+      return this._opError(id, "copy", "bad", "source and destination are the same");
+    }
+    let st;
+    try {
+      st = statSync(from.abs);
+    } catch {
+      return this._opError(id, "copy", "notfound", `no such file or directory: ${fromPath}`);
+    }
+    try {
+      if (st.isDirectory()) {
+        cpSync(from.abs, to.abs, { recursive: true, force: true, errorOnExist: false });
+      } else {
+        copyFileSync(from.abs, to.abs);
+      }
+    } catch (e) {
+      return this._opError(id, "copy", "io", `cannot copy: ${e.message}`);
+    }
+    this._sendMeta({ t: "copy_ok", id });
+    this.log(`[files] copy ${from.abs} -> ${to.abs} (${this.session.user})`);
+  }
+
   _meta(payload) {
     let msg;
     try {
@@ -256,6 +284,7 @@ export class FileService {
     if (msg.t === "mkdir") return this._mkdir(msg);
     if (msg.t === "delete") return this._delete(msg);
     if (msg.t === "rename") return this._rename(msg);
+    if (msg.t === "copy") return this._copy(msg);
     if (msg.t === "eof") {
       // client finished streaming its push; required for zero-byte files
       // where no FILE_CHUNK ever arrives to trigger completion
