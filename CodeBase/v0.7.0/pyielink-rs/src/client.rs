@@ -335,7 +335,6 @@ fn gui_session_run(
     events: mpsc::Sender<GuiEvent>,
     stop: Arc<AtomicU8>,
 ) -> Result<(), String> {
-    use std::net::UdpSocket;
     let (user, ip) = parse_target(target)?;
     let port: u16 = std::env::var("PYIELINK_PORT")
         .ok()
@@ -550,85 +549,23 @@ pub fn run_session(target: &str, mode: RunMode) -> Result<(), String> {
         println!("  [ok] connected to {}", addr);
     }
 
-    let hello = format!("{}\n{}\n", user, env!("CARGO_PKG_VERSION"));
-    proto::write_frame(&mut stream, HELLO, hello.as_bytes())
-        .map_err(|e| format!("handshake send failed: {}", e))?;
-
     // Auth: answer challenges with proofs; secrets never leave this machine.
     // p-mode: derive the same iterated hash the host stores, prove over that.
     // t-mode: the stored token file holds sha256(token); prove over that.
-    let mut attempts = 0u32;
-    let data_port;
-    let session_key;
-    
-    loop {
-        match expect_frame(&mut stream)? {
-            (CHALLENGE, payload) => {
-                let line = String::from_utf8_lossy(&payload).into_owned();
-                let (salt, nonce) = match line.split_once('\n') {
-                    Some(x) => (x.0.to_string(), x.1.trim().to_string()),
-                    None => return Err("malformed challenge from host".into()),
-                };
-                // Password is required on every connection by default;
-                // scripted runs must never block on a hidden console
-                // read: fail fast instead of hang.
-                if !creds::stdin_is_tty()
-                    && std::env::var("PYIELINK_SHELL").as_deref() != Ok("1")
-                    && std::env::var("PYIELINK_REPL").as_deref() != Ok("1")
-                    && !matches!(mode, RunMode::Shell)
-                {
-                    return Err(format!(
-                        "password required for {}@{} — run from an interactive terminal (or set PYIELINK_SHELL=1 for scripted use)",
-                        user, ip
-                    ));
-                }
-                if attempts >= 3 {
-                    return Err("too many failed authentication attempts".into());
-                }
-                attempts += 1;
-                let framed = format!("p:{}", password_proof(&salt, &nonce));
-                proto::write_frame(&mut stream, PROOF, framed.as_bytes())
-                    .map_err(|e| format!("send failed: {}", e))?;
-            }
-            (LICENSE_TEXT, payload) => {
-                if license_preaccepted() {
-                    println!("  [i] agreement pre-accepted via PYIELINK_ACCEPT_LICENSE (you are accountable for authorization)");
-                } else {
-                    println!("\n{}", String::from_utf8_lossy(&payload));
-                    if !confirm_license() {
-                        proto::write_frame(&mut stream, LICENSE_REJECT, b"n")
-                            .map_err(|e| e.to_string())?;
-                        return Err("license rejected — session aborted".into());
-                    }
-                }
-                proto::write_frame(&mut stream, LICENSE_ACCEPT, b"y")
-                    .map_err(|e| e.to_string())?;
-            }
-            (TOKEN_ISSUED, _payload) => {
-                // Not stored: password is required each connection.
-            }
-            (AUTH_OK, payload) => {
-                let ticket = String::from_utf8_lossy(&payload).into_owned();
-                let (dp, sk) = split_ticket(ticket.trim())?;
-                data_port = dp;
-                session_key = sk;
-                println!(
-                    "  [ok] session promoted. data layer ready on {}:{}. session key received.",
-                    ip, data_port
-                );
-                break;
-            }
-            (AUTH_FAIL, payload) => {
-                return Err(format!(
-                    "host refused: {}",
-                    String::from_utf8_lossy(&payload).trim()
-                ));
-            }
-            (msg, _) => {
-                return Err(format!("unexpected frame 0x{:02X} during handshake", msg));
-            }
-        }
-    }
+    // Password is required on every connection by default; scripted runs
+    // must never block on a hidden console read: fail fast instead of hang.
+    let silent_no_tty = !creds::stdin_is_tty()
+        && std::env::var("PYIELINK_SHELL").as_deref() != Ok("1")
+        && std::env::var("PYIELINK_REPL").as_deref() != Ok("1")
+        && !matches!(mode, RunMode::Shell);
+    let (data_port, session_key) = do_handshake(
+        &mut stream,
+        &user,
+        &ip,
+        None,
+        license_preaccepted(),
+        silent_no_tty,
+    )?;
     
     // Initialize session state
     let session_state_arc = Arc::new(std::sync::Mutex::new(SessionState::new(user.clone(), ip.clone(), session_key.clone(), data_port.clone())));
@@ -682,7 +619,7 @@ pub fn run_session(target: &str, mode: RunMode) -> Result<(), String> {
     let input_running = Arc::new(AtomicBool::new(false));
     let mut input_handle: Option<std::thread::JoinHandle<()>> = None;
     if interactive && matches!(mode, RunMode::Shell) {
-        println!("  [i] remote terminal ready — ls/cd/pwd/mkdir/rm/mv, get/put, input start/stop, exit");
+        println!("  [i] remote terminal ready — ls/cd/pwd/mkdir/rm/mv/copy, get/put, input start/stop, exit");
         print!("pyielink> ");
         let _ = std::io::stdout().flush();
     }
@@ -1918,6 +1855,19 @@ fn post_auth_loop(
                                 let _ = xfer_tx.send(DlCommand::Rename { old: from, new: to });
                             } else {
                                 println!("  [i] usage: rename <source> <dest>");
+                            }
+                            print!("pyielink> ");
+                            let _ = std::io::stdout().flush();
+                            continue;
+                        }
+                        if let Some(arg) = l.strip_prefix("copy ").or_else(|| l.strip_prefix("cp ")) {
+                            let parts: Vec<&str> = arg.splitn(2, |c| c == ' ' || c == '\t').collect();
+                            if parts.len() == 2 {
+                                let from = resolve_remote(&remote_cwd, parts[0].trim());
+                                let to   = resolve_remote(&remote_cwd, parts[1].trim());
+                                let _ = xfer_tx.send(DlCommand::Copy { from, to });
+                            } else {
+                                println!("  [i] usage: copy <source> <dest>");
                             }
                             print!("pyielink> ");
                             let _ = std::io::stdout().flush();
