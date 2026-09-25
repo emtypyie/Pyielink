@@ -214,6 +214,9 @@ fn handle_conn(mut stream: TcpStream) {
         return;
     }
     record_success(peer_ip);
+    // TODO: Argon2id migration — after successful legacy auth, initiate
+    // rehash protocol to upgrade pw_hash from SHA-256 to Argon2id.
+    // Requires client-side plaintext password round-trip over the TLS channel.
 
     // License gate (skipped for returning token sessions)
     if !record0.licensed {

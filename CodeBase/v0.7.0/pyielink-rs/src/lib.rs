@@ -9,4 +9,4 @@ pub mod sessions;
 pub mod token;
 
 pub use client::{run_session, DlCommand, RunMode, InputEvent, RemoteEvent, DirEntry, DirListing};
-pub use creds::add_user;
+pub use creds::{add_user, cmd_disable};

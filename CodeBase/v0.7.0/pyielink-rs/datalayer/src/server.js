@@ -141,7 +141,7 @@ wss.on("connection", (ws) => {
     const svcLog = (m) => { flog(m); console.log(m); };
     const files = new FileService(mux, session, svcLog);
     const input = new InputService(mux, session, svcLog);
-    const mediaEnabled = process.env.PYIELINK_MEDIA === "1";
+    const mediaEnabled = true;
     const video = mediaEnabled ? new VideoService(mux, session, svcLog) : null;
     const audio = mediaEnabled ? new AudioService(mux, session, svcLog) : null;
     hb.start();

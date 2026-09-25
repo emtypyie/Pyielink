@@ -1,0 +1,81 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        node-version: [18.x]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          components: rustfmt, clippy
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install ffmpeg
+        uses: rvdavids/action-ffmpeg@v2
+        with:
+          ffmpeg-version: 'latest'
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release
+        run: cargo build --release
+        working-directory: CodeBase/v0.7.0/pyielink-rs
+
+      - name: Run tests
+        run: cargo test
+        working-directory: CodeBase/v0.7.0/pyielink-rs
+
+      - name: Run clippy
+        run: cargo clippy --release -- -D warnings
+        working-directory: CodeBase/v0.7.0/pyielink-rs
+
+      - name: Build datalayer
+        run: npm ci && npm run build
+        working-directory: CodeBase/v0.7.0/pyielink-rs/datalayer
+
+      - name: Build GUI (optional)
+        run: cargo build --features gui --release
+        working-directory: CodeBase/v0.7.0/pyielink-rs
+        continue-on-error: true
+
+      - name: Package release
+        run: |
+          mkdir -p package
+          Copy-Item target/release/pyielink-cli.exe package/pyielink.exe
+          Copy-Item -Recurse datalayer package/datalayer
+          Copy-Item LICENSE.txt package/LICENSE.txt
+          Copy-Item README.md package/README.md
+        working-directory: CodeBase/v0.7.0/pyielink-rs
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyielink-release
+          path: package/

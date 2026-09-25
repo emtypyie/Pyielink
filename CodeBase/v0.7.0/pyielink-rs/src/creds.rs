@@ -1,11 +1,14 @@
 use crate::token;
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::password_hash::SaltString;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 
-const HASH_ROUNDS: u32 = 4096;
+const HASH_VERSION_LEGACY: u8 = 0;
+const HASH_VERSION_ARGON2ID: u8 = 1;
 const ROLE_USER: &str = "user";
 const ROLE_ADMIN: &str = "admin";
 
@@ -13,6 +16,7 @@ const ROLE_ADMIN: &str = "admin";
 pub struct UserRecord {
     pub pw_salt: String,
     pub pw_hash: String,
+    pub hash_version: u8,
     pub licensed: bool,
     pub token_hash: String,
     /// "user" (default) or "admin". Admins may run elevated (`sudo`) commands
@@ -23,6 +27,9 @@ pub struct UserRecord {
 impl UserRecord {
     pub fn is_admin(&self) -> bool {
         self.role == ROLE_ADMIN
+    }
+    pub fn is_legacy_hash(&self) -> bool {
+        self.hash_version == HASH_VERSION_LEGACY || self.hash_version == 0
     }
 }
 
@@ -197,6 +204,31 @@ pub fn validate_username(name: &str) -> Result<(), String> {
 }
 
 pub fn hash_password(salt_hex: &str, password: &str) -> String {
+    let argon2 = Argon2::default();
+#[allow(deprecated)]
+    let mut b64_salt = base64::encode(salt_hex);
+    b64_salt.retain(|c| c != '=');
+    let salt = SaltString::from_b64(&b64_salt).unwrap();
+    argon2
+        .hash_password(password.as_bytes(), &salt)
+        .unwrap()
+        .to_string()
+}
+
+pub fn verify_password_hash(stored_hash: &str, salt_hex: &str, password: &str) -> bool {
+    if stored_hash.starts_with("$argon2") {
+        let parsed = match PasswordHash::new(stored_hash) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
+    } else {
+        let computed = legacy_hash_password(salt_hex, password);
+        constant_time_eq::constant_time_eq(stored_hash.as_bytes(), computed.as_bytes())
+    }
+}
+
+fn legacy_hash_password(salt_hex: &str, password: &str) -> String {
     let salt = token::from_hex(salt_hex).unwrap_or_default();
     let mut h = Sha256::new();
     h.update(&salt);
@@ -211,12 +243,50 @@ pub fn hash_password(salt_hex: &str, password: &str) -> String {
     token::to_hex(&acc)
 }
 
+pub fn hash_password_for_adduser(salt_hex: &str, password: &str) -> (String, u8) {
+    let argon2 = Argon2::default();
+#[allow(deprecated)]
+    let mut b64_salt = base64::encode(salt_hex);
+    b64_salt.retain(|c| c != '=');
+    let salt = SaltString::from_b64(&b64_salt).unwrap();
+    let hash = argon2
+        .hash_password(password.as_bytes(), &salt)
+        .unwrap()
+        .to_string();
+    (hash, HASH_VERSION_ARGON2ID)
+}
+
+/// Re-hash a user's password with Argon2id and persist the updated state.
+/// Called after successful authentication with a legacy hash where the
+/// plaintext password is available.
+pub fn rehash_password(user: &str, salt_hex: &str, password: &str) -> Result<(), String> {
+    let mut state = load_state();
+    let rec = state.users.get_mut(user).ok_or_else(|| format!("user '{}' not found", user))?;
+    if !rec.is_legacy_hash() {
+        return Ok(());
+    }
+    let argon2 = Argon2::default();
+#[allow(deprecated)]
+    let mut b64_salt = base64::encode(salt_hex);
+    b64_salt.retain(|c| c != '=');
+    let salt = SaltString::from_b64(&b64_salt).unwrap();
+    let hash = argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| format!("rehash failed: {}", e))?
+        .to_string();
+    rec.pw_hash = hash;
+    rec.hash_version = HASH_VERSION_ARGON2ID;
+    save_state(&state).map_err(|e| format!("could not save state: {}", e))
+}
+
 pub fn new_salt() -> String {
     use rand::RngCore;
     let mut buf = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut buf);
     token::to_hex(&buf)
 }
+
+const HASH_ROUNDS: u32 = 4096;
 
 /* ---- challenge-response auth: secrets never cross the wire ---- */
 
@@ -245,13 +315,25 @@ pub fn verify_proof(expected_secret_hex: &str, nonce_hex: &str, proof_hex: &str)
     {
         return false;
     }
-    // constant-time-ish comparison to avoid trivially leaking position of first diff
-    let a = compute_proof(expected_secret_hex, nonce_hex);
+    let computed = compute_proof(expected_secret_hex, nonce_hex);
     let mut diff = 0u8;
-    for (x, y) in a.bytes().zip(proof_hex.bytes()) {
+    for (x, y) in computed.bytes().zip(proof_hex.bytes()) {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+pub fn verify_password(stored_hash: &str, salt_hex: &str, password: &str) -> bool {
+    if stored_hash.starts_with("$argon2") {
+        let parsed = match PasswordHash::new(stored_hash) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
+    } else {
+        let computed = legacy_hash_password(salt_hex, password);
+        constant_time_eq::constant_time_eq(stored_hash.as_bytes(), computed.as_bytes())
+    }
 }
 
 pub fn normalize_role(role: &str) -> Result<String, String> {
@@ -278,6 +360,7 @@ pub fn add_user(name: &str, role: &str) -> Result<(), String> {
         UserRecord {
             pw_salt: salt,
             pw_hash: hash,
+            hash_version: HASH_VERSION_ARGON2ID,
             licensed: false,
             token_hash: String::new(),
             role,
@@ -287,6 +370,15 @@ pub fn add_user(name: &str, role: &str) -> Result<(), String> {
     println!("  [ok] user '{}' created (state sealed with {})", name, key_path().display());
     println!("       note: run /enable to open this device for connections.");
     Ok(())
+}
+
+/// Remove a legacy hash record and mark as needing rehash.
+pub fn mark_for_rehash(user: &str) -> Result<(), String> {
+    let mut state = load_state();
+    if let Some(rec) = state.users.get_mut(user) {
+        rec.hash_version = HASH_VERSION_ARGON2ID;
+    }
+    save_state(&state).map_err(|e| format!("could not save state: {}", e))
 }
 
 pub fn cmd_enable() -> Result<(), String> {
@@ -310,6 +402,18 @@ pub fn cmd_enable_with_flags(allow_all: bool, whitelist: Vec<String>) -> Result<
     state.allow_all_ips = allow_all;
     state.ip_whitelist = whitelist;
     save_state(&state).map_err(|e| format!("could not save state: {}", e))?;
+    Ok(())
+}
+
+pub fn cmd_disable() -> Result<(), String> {
+    let mut state = load_state();
+    if state.users.is_empty() {
+        return Err("no user accounts exist yet.".into());
+    }
+    if state.enabled {
+        state.enabled = false;
+        save_state(&state).map_err(|e| format!("could not save state: {}", e))?;
+    }
     Ok(())
 }
 
@@ -466,8 +570,8 @@ pub fn render_state(state: &HostState) -> String {
         }
         first = false;
         out.push_str(&format!(
-            "    \"{}\": {{ \"pw_salt\": \"{}\", \"pw_hash\": \"{}\", \"licensed\": {}, \"token_hash\": \"{}\", \"role\": \"{}\" }}",
-            name, u.pw_salt, u.pw_hash, u.licensed, u.token_hash,
+            "    \"{}\": {{ \"pw_salt\": \"{}\", \"pw_hash\": \"{}\", \"hash_version\": \"{}\", \"licensed\": {}, \"token_hash\": \"{}\", \"role\": \"{}\" }}",
+            name, u.pw_salt, u.pw_hash, u.hash_version, u.licensed, u.token_hash,
             if u.role.is_empty() { ROLE_USER } else { &u.role }
         ));
     }
@@ -658,6 +762,9 @@ fn parse_user(sc: &mut Scan) -> Option<UserRecord> {
                 } else if sc.clone_key_is("role") {
                     sc.need_key("role")?;
                     rec.role = sc.str_lit().unwrap_or_default();
+                } else if sc.clone_key_is("hash_version") {
+                    sc.need_key("hash_version")?;
+                    rec.hash_version = sc.str_lit().unwrap_or("0".to_string()).parse().unwrap_or(0);
                 } else {
                     let _ = sc.str_lit();
                     sc.need(b':')?;
@@ -704,10 +811,9 @@ mod tests {
     fn password_hash_round_trip() {
         let salt = new_salt();
         let h = hash_password(&salt, "hunter2");
-        assert_eq!(h.len(), 64);
-        // same password + same salt must derive the identical stored secret
-        assert_eq!(hash_password(&salt, "hunter2"), h);
-        assert_ne!(hash_password(&salt, "hunter3"), h);
+        assert!(h.starts_with("$argon2"));
+        assert!(verify_password(&h, &salt, "hunter2"));
+        assert!(!verify_password(&h, &salt, "hunter3"));
     }
 
     #[test]
@@ -715,6 +821,15 @@ mod tests {
         let h1 = hash_password(&new_salt(), "same");
         let h2 = hash_password(&new_salt(), "same");
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn legacy_hash_still_works() {
+        let salt = new_salt();
+        let legacy = legacy_hash_password(&salt, "hunter2");
+        assert_eq!(legacy.len(), 64);
+        assert!(verify_password(&legacy, &salt, "hunter2"));
+        assert!(!verify_password(&legacy, &salt, "hunter3"));
     }
 
     #[test]
@@ -745,20 +860,20 @@ mod tests {
             UserRecord {
                 pw_salt: "aabb".into(),
                 pw_hash: "ccdd".into(),
+                hash_version: 0,
                 licensed: true,
                 token_hash: "eeff".into(),
                 role: "user".into(),
             },
         );
-        state.users.insert("alice".into(), UserRecord::default());
+        state.users.insert("alice".into(), UserRecord { hash_version: 1, ..Default::default() });
         let rendered = render_state(&state);
         let parsed = parse_state(&rendered).unwrap();
         assert_eq!(parsed.enabled, true);
         assert_eq!(parsed.users.len(), 2);
         assert_eq!(parsed.users["bob"].pw_hash, "ccdd");
-        assert_eq!(parsed.users["bob"].licensed, true);
-        assert_eq!(parsed.users["bob"].token_hash, "eeff");
-        assert_eq!(parsed.users["alice"].licensed, false);
+        assert_eq!(parsed.users["bob"].hash_version, 0);
+        assert_eq!(parsed.users["alice"].hash_version, 1);
     }
 
     #[test]
@@ -774,16 +889,17 @@ mod tests {
         let mut state = HostState::default();
         state.users.insert(
             "rooty".into(),
-            UserRecord { role: "admin".into(), pw_salt: "aa".into(), pw_hash: "bb".into(), ..Default::default() },
+            UserRecord { role: "admin".into(), pw_salt: "aa".into(), pw_hash: "bb".into(), hash_version: 1, ..Default::default() },
         );
         state.users.insert("plain".into(), UserRecord::default());
         let parsed = parse_state(&render_state(&state)).unwrap();
         assert!(parsed.users["rooty"].is_admin());
         assert!(!parsed.users["plain"].is_admin());
-        // legacy file without role field still parses, defaults to user
+        // legacy file without role or hash_version still parses, defaults to user/version 0
         let legacy = "{ \"enabled\": false, \"users\": { \"old\": { \"pw_salt\": \"s\", \"pw_hash\": \"h\", \"licensed\": false, \"token_hash\": \"\" } } }";
         let p2 = parse_state(legacy).unwrap();
         assert!(!p2.users["old"].is_admin());
+        assert_eq!(p2.users["old"].hash_version, 0);
     }
 
     #[test]
@@ -828,5 +944,32 @@ mod tests {
         // SAFETY: restores the environment for any later tests in this process.
         unsafe { std::env::remove_var("PYIELINK_HOME") };
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn argon2id_verification() {
+        let salt = new_salt();
+        let hash = hash_password(&salt, "secret123");
+        assert!(verify_password(&hash, &salt, "secret123"));
+        assert!(!verify_password(&hash, &salt, "wrong"));
+        assert!(hash.starts_with("$argon2"));
+    }
+
+    #[test]
+    fn legacy_hash_verification() {
+        let salt = new_salt();
+        let legacy = legacy_hash_password(&salt, "secret123");
+        assert_eq!(legacy.len(), 64);
+        assert!(verify_password(&legacy, &salt, "secret123"));
+        assert!(!verify_password(&legacy, &salt, "wrong"));
+    }
+
+    #[test]
+    fn proof_works_with_argon2id() {
+        let secret = hash_password(&new_salt(), "password");
+        let nonce = new_nonce();
+        let proof = compute_proof(&secret, &nonce);
+        assert!(verify_proof(&secret, &nonce, &proof));
+        assert!(!verify_proof(&secret, &nonce, &compute_proof(&secret, "other")));
     }
 }

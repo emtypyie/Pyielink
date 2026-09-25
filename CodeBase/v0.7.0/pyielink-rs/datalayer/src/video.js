@@ -97,35 +97,28 @@ function probeHardware(log) {
 // supports here. Cross-platform: Windows ddagrab/gdigrab, Linux pipewire/x11grab,
 // macOS avfoundation. Tries DXGI first on Windows when dxgi_capture.exe is present,
 // then falls back to native ffmpeg grab methods.
-function pickCapture(hw) {
+function pickCapture(log) {
   const p = process.platform;
   const captureEnv = process.env.PYIELINK_CAPTURE; // "dxgi" | "gdigrab"
 
   if (p === "win32") {
-    // Respect explicit env override first
     if (captureEnv === "gdigrab") return { fmt: "gdigrab", arg: "desktop", fr: "60" };
     if (captureEnv === "dxgi") {
-      // User explicitly asked for DXGI; still check if helper exists
       const dxgiExe = path.join(ASSETS, "dxgi_capture.exe");
       if (existsSync(dxgiExe)) return { fmt: "ddagrab", arg: "desktop", fr: "60" };
-      this.log &&
-        this.log("[video] PYIELINK_CAPTURE=dxgi set but dxgi_capture.exe missing; falling back to gdigrab");
+      log("[video] PYIELINK_CAPTURE=dxgi set but dxgi_capture.exe missing; falling back to gdigrab");
       return { fmt: "gdigrab", arg: "desktop", fr: "60" };
     }
-    // Default: try ddagrab (DXGI Desktop Duplication) if helper exists,
-    // otherwise fall back to gdigrab (GDI BitBlt).
     const dxgiExe = path.join(ASSETS, "dxgi_capture.exe");
     if (existsSync(dxgiExe)) return { fmt: "ddagrab", arg: "desktop", fr: "60" };
     return { fmt: "gdigrab", arg: "desktop", fr: "60" };
   }
   if (p === "linux") {
-    if (hw.captures.includes("pipewire")) return { fmt: "pipewire", arg: "desktop", fr: "60" };
     return { fmt: "x11grab", arg: ":0.0", fr: "60" };
   }
   if (p === "darwin") {
     return { fmt: "avfoundation", arg: "1:none", fr: "60" };
   }
-  // Fallback for any other platform
   return { fmt: "gdigrab", arg: "desktop", fr: "60" };
 }
 
@@ -148,6 +141,8 @@ export class VideoService {
         this.paused = false;
         this._spawnTime = 0;
         this._frameCount = 0;
+        this.dxgiForcedOff = false;
+        this._lastRestart = 0;
         // latency CSV header
         try { appendFileSync(LATENCY_CSV, "ts,stage,ms,extra\n"); } catch {}
         // Adaptive bitrate
@@ -237,15 +232,16 @@ export class VideoService {
     _spawnFFmpeg() {
         if (!this.active) return;
 
-        const hw = probeHardware(this.log);
-        const cap = pickCapture(hw);
+const hw = probeHardware(this.log);
+        const cap = pickCapture(this.log);
         let inputFormat = cap.fmt;
         let inputArg = cap.arg;
         // ddagrab (ffmpeg's DXGI Desktop Duplication) needs a GPU + active
         // Desktop Duplication session — unavailable on GPU-less / RDP / VM hosts.
         // Probe it; if it fails, fall back to gdigrab (CPU/GDI), which works
         // without a GPU as long as a desktop session exists.
-if (inputFormat === "ddagrab" && !this.dxgiForcedOff) {
+        const dxgiExe = path.join(ASSETS, "dxgi_capture.exe");
+ if (inputFormat === "ddagrab" && !this.dxgiForcedOff) {
             // DDagrab requires the dxgi_capture.exe helper; if it's not available
             // or was previously forced off, skip the ffmpeg probe and go straight to gdigrab.
             if (!existsSync(dxgiExe)) {
@@ -337,7 +333,6 @@ if (inputFormat === "ddagrab" && !this.dxgiForcedOff) {
         // GPU. The C++ helper (assets/dxgi_capture.exe) grabs frames and
         // pipes raw BGRA to ffmpeg, which only encodes (NVENC/QSV/...).
         const dxgiExe = path.join(ASSETS, "dxgi_capture.exe");
-        if (this.dxgiForcedOff === undefined) this.dxgiForcedOff = false;
         let useDxgi = false;
         if (this.dxgiForcedOff) {
             this.log("[video] DXGI disabled after previous failure; using gdigrab");

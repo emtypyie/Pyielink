@@ -3,7 +3,7 @@ use std::process::{self, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::io::{BufRead, BufReader};
 
-use pyielink::creds::{add_to_whitelist, remove_from_whitelist, add_user, cmd_enable_with_flags};
+use pyielink::creds::{add_to_whitelist, remove_from_whitelist, add_user, cmd_enable_with_flags, cmd_disable};
 
 /// Read a port from the given env var, defaulting to `fallback` on missing/invalid values.
 fn env_port(name: &str, fallback: u16) -> u16 {
@@ -18,9 +18,10 @@ fn print_usage() {
     eprintln!("  user@ip explorer          Open the file-explorer GUI (needs 'gui' feature)");
     eprintln!("  user@ip explorer --repl   File-explorer terminal session (same as the REPL)");
     eprintln!("  --repl user@ip            Same as above (legacy flag, ignored)");
-    eprintln!("  enable                  Enable host for connections");
+    eprintln!("  enable                    Enable host for connections");
     eprintln!("  enable --all             Enable host for connections from any IP");
     eprintln!("  enable --whitelist IP    Allow connections from specific IP");
+    eprintln!("  disable                   Disable host for connections");
     eprintln!("  adduser -m <name>        Create a host user account (prompts for password)");
     eprintln!("  adduser -m <name> -r <role>  Create account with role user|admin");
     eprintln!("  whitelist add IP         Add IP to connection whitelist");
@@ -114,6 +115,13 @@ fn main() {
 
             match cmd_enable_with_flags(allow_all, whitelist) {
                 Ok(()) => println!("  [ok] host enabled"),
+                Err(e) => eprintln!("  [error] {}", e),
+            }
+        }
+
+        "disable" => {
+            match cmd_disable() {
+                Ok(()) => println!("  [ok] host disabled"),
                 Err(e) => eprintln!("  [error] {}", e),
             }
         }
