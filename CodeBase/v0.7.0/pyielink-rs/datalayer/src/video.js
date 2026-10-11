@@ -332,7 +332,7 @@ const hw = probeHardware(this.log);
         // Desktop Duplication runs at the display refresh (60/120/144) on the
         // GPU. The C++ helper (assets/dxgi_capture.exe) grabs frames and
         // pipes raw BGRA to ffmpeg, which only encodes (NVENC/QSV/...).
-        const dxgiExe = path.join(ASSETS, "dxgi_capture.exe");
+        
         let useDxgi = false;
         if (this.dxgiForcedOff) {
             this.log("[video] DXGI disabled after previous failure; using gdigrab");
