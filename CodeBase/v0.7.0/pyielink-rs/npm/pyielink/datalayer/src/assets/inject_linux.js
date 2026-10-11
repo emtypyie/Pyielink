@@ -1,15 +1,16 @@
 #!/usr/bin/env node
-// Linux host-side input injection (scaffold).
+// Linux host-side input injection (updated with flags support).
 //
 // Spawned by datalayer/src/input.js. Reads one JSON event per line on stdin
 // using the SAME schema as assets/inject.ps1:
-//   {"t":"key","vk":65,"up":false}
-//   {"t":"mouse","type":"move|ldown|lup|rdown|rup|mdown|mup|wheel","x":N,"y":N,"delta":N}
-// Mouse x/y arrive NORMALIZED to 0..65535 across the remote screen; we scale
+//   {"t":"key","vk":65,"up":false,"flags":3}
+//   {"t":"mouse","type":"move|ldown|lup|rdown|rup|mdown|mup|wheel","x":N,"y":N,"delta":N,"flags":0}
+// Mouse x/y arrive NORMALIZED (0..65535 across the remote screen), we scale
 // them to the real display geometry (xdotool getdisplaygeometry) before replay.
 //
 // Requires `xdotool` on PATH (apt install xdotool / dnf install xdotool ...).
 // Keys: Windows VK codes are mapped to xdotool keysyms (best-effort subset).
+// Modifier flags (Shift, Ctrl, Alt) are propagated from the remote side.
 
 import { spawnSync } from "node:child_process";
 
@@ -57,18 +58,30 @@ function run(args) {
   try { spawnSync("xdotool", args, { stdio: "ignore" }); } catch {}
 }
 
-let buf = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (d) => {
-  buf += d;
-  let i;
-  while ((i = buf.indexOf("\n")) >= 0) {
-    const line = buf.slice(0, i);
-    buf = buf.slice(i + 1);
-    handle(line);
+// Parse flags bitmask: bit0=Shift, bit1=Ctrl, bit2=Alt
+function parseFlags(flags) {
+  const s = !! (flags & 1);  // Shift
+  const c = !! (flags & 2);  // Ctrl
+  const a = !! (flags & 4);  // Alt
+  return { shift: s, ctrl: c, alt: a };
+}
+
+function keyDownKeysym(ks, {shift, ctrl, alt}) {
+  const mods = [];
+  if (shift) mods.push("Shift");
+  if (ctrl) mods.push("Ctrl");
+  if (alt) mods.push("Alt");
+  const m = mods.length > 0 ? "+" + mods.join("+") : "";
+  run(["keydown", m, ks]);
+  run(["keyup", m, ks]);
+}
+
+function keyDownVk(vk, {shift, ctrl, alt}) {
+  const ks = vkToKeysym(Number(vk));
+  if (ks) {
+    keyDownKeysym(ks, {shift, ctrl, alt});
   }
-});
-process.stdin.on("end", () => process.exit(0));
+}
 
 function handle(line) {
   line = (line || "").trim();
@@ -79,14 +92,27 @@ function handle(line) {
 
   if (ev.t === "mouse") {
     const [x, y] = px(ev.x, ev.y);
+    const { shift: haveShift, ctrl: haveCtrl, alt: haveAlt } = parseFlags(ev.flags || 0);
     switch (ev.type) {
       case "move": run(["mousemove", String(x), String(y)]); break;
-      case "ldown": run(["mousemove", String(x), String(y)]); run(["mousedown", "1"]); break;
-      case "lup": run(["mousemove", String(x), String(y)]); run(["mouseup", "1"]); break;
-      case "rdown": run(["mousemove", String(x), String(y)]); run(["mousedown", "3"]); break;
-      case "rup": run(["mousemove", String(x), String(y)]); run(["mouseup", "3"]); break;
-      case "mdown": run(["mousemove", String(x), String(y)]); run(["mousedown", "2"]); break;
-      case "mup": run(["mousemove", String(x), String(y)]); run(["mouseup", "2"]); break;
+      case "ldown": run(["mousemove", String(x), String(y)]); 
+                    if (haveCtrl) run(["key", "Ctrl_L"]); 
+                    run(["mousedown", "1"]); break;
+      case "lup": run(["mousemove", String(x), String(y)]); 
+                if (haveCtrl) run(["key", "Ctrl_L"]); 
+                run(["mouseup", "1"]); break;
+      case "rdown": run(["mousemove", String(x), String(y)]); 
+                    if (haveShift) run(["key", "Shift_L"]); 
+                    run(["mousedown", "3"]); break;
+      case "rup": run(["mousemove", String(x), String(y)]); 
+                if (haveShift) run(["key", "Shift_L"]); 
+                run(["mouseup", "3"]); break;
+      case "mdown": run(["mousemove", String(x), String(y)]); 
+                    if (haveAlt) run(["key", "Alt_L"]); 
+                    run(["mousedown", "2"]); break;
+      case "mup": run(["mousemove", String(x), String(y)]); 
+                if (haveAlt) run(["key", "Alt_L"]); 
+                run(["mouseup", "2"]); break;
       case "wheel": {
         const steps = Math.max(1, Math.min(20, Math.round(Math.abs(Number(ev.delta) || 0) / 120)));
         const btn = (Number(ev.delta) || 0) > 0 ? "5" : "4"; // down / up
@@ -96,7 +122,119 @@ function handle(line) {
       default: run(["mousemove", String(x), String(y)]);
     }
   } else if (ev.t === "key") {
-    const ks = vkToKeysym(Number(ev.vk));
-    if (ks) run(ev.up ? ["keyup", ks] : ["keydown", ks]);
+    const { shift, ctrl, alt } = parseFlags(ev.flags || 0);
+    keyDownVk(ev.vk, {shift, ctrl, alt});
   }
+}
+
+// Per-platform injector scripts. All speak the SAME JSON-line protocol on stdin
+// (see assets/inject.ps1 for the schema) so InputService just writes lines.
+function injectorForPlatform() {
+  switch (process.platform) {
+    case "win32":
+      return {
+        label: "windows(SendInput)",
+        script: path.join(ASSETS, "inject.ps1"),
+        cmd: "powershell",
+        args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(ASSETS, "inject.ps1")],
+      };
+    case "linux":
+      return {
+        label: "linux(xdotool)",
+        script: path.join(ASSETS, "inject_linux.js"),
+        cmd: "node",
+        args: [path.join(ASSETS, "inject_linux.js")],
+      };
+    case "darwin":
+      return {
+        label: "macos(cliclick)",
+        script: path.join(ASSETS, "inject_mac.js"),
+        cmd: "node",
+        args: [path.join(ASSETS, "inject_mac.js")],
+      };
+    default:
+      return null;
+  }
+}
+
+export class InputService {
+    constructor(mux, session, log) {
+        this.mux = mux;
+        this.session = session;
+        this.log = log || (() => {});
+        this.active = false;
+        this.injector = null;
+        this.eventCount = 0;
+
+        mux.on(CHANNELS.INPUT, (payload) => this._handleInput(payload));
+    }
+
+    _handleInput(payload) {
+        try {
+            const msg = JSON.parse(payload.toString("utf8"));
+            if (msg.t === "input_start") {
+                this.start();
+                return;
+            }
+            if (msg.t === "input_stop") {
+                this.stop();
+                return;
+            }
+            if (!this.active || !this.injector) return;
+
+            // Accept a single event object, an array, or { events: [...] }.
+            let events;
+            if (Array.isArray(msg)) events = msg;
+            else if (Array.isArray(msg.events)) events = msg.events;
+            else if (msg.t === "key" || msg.t === "mouse") events = [msg];
+            else return;
+
+            for (const ev of events) {
+                const line = JSON.stringify(ev);
+                this.eventCount += 1;
+                if (this.eventCount === 1 || this.eventCount % 50 === 0) {
+                    this.log(`[input] received ${this.eventCount} events (last: ${line.slice(0, 80)})`);
+                }
+                try {
+                    this.injector.stdin.write(line + "\n");
+                } catch {
+                    /* injector died mid-session; stop() will clean up */
+                }
+            }
+        } catch (e) {
+            this.log(`[input] parse error: ${e.message}`);
+        }
+    }
+
+    start() {
+        if (this.active) return;
+        const pick = injectorForPlatform();
+        if (!pick) {
+            this.log(`[input] no injector for platform ${process.platform}`);
+            return;
+        }
+        if (!existsSync(pick.script)) {
+            this.log(`[input] injector missing: ${pick.script} (install ${pick.label})`);
+            return;
+        }
+        this.injector = spawn(pick.cmd, pick.args, { stdio: ["pipe", "ignore", "pipe"] });
+        this.injector.stderr.on("data", (d) => {
+            const s = d.toString().trim();
+            if (s) this.log(`[input] injector: ${s}`);
+        });
+        this.injector.on("exit", () => { this.injector = null; });
+        this.active = true;
+        this.log(`[input] capture started (${pick.label})`);
+    }
+
+    stop() {
+        if (!this.active) return;
+        this.active = false;
+        if (this.eventCount > 0) this.log(`[input] session total: ${this.eventCount} events`);
+        if (this.injector) {
+            try { this.injector.kill(); } catch {}
+            this.injector = null;
+        }
+        this.log("[input] capture stopped");
+    }
 }
